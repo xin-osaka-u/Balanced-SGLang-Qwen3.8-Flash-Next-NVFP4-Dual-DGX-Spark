@@ -1,0 +1,21 @@
+ifeval/ifeval: {'sample_len': 541, 'prompt_level_strict_acc,none': 0.8706, 'inst_level_strict_acc,none': 0.9113, 'prompt_level_loose_acc,none': 0.9002, 'inst_level_loose_acc,none': 0.9341}  n=541
+mgsm/mgsm_native_cot_ja: {'sample_len': 250, 'exact_match,strict-match': 0.0, 'exact_match,flexible-extract': 0.8}  n=250
+mgsm/mgsm_native_cot_zh: {'sample_len': 250, 'exact_match,strict-match': 0.004, 'exact_match,flexible-extract': 0.82}  n=250
+tqa/truthfulqa_mc2: {'sample_len': 817, 'acc,none': 0.6669}  n=817
+tqa/truthfulqa_zh_mc2: {'sample_len': 788, 'acc,none': 0.5624}  n=788
+mmlu_pro/mmlu_pro: {'sample_len': 350, 'exact_match,custom-extract': 0.82}  n=?
+mmlu_pro/mmlu_pro_biology: {'sample_len': 25, 'exact_match,custom-extract': 0.92}  n=25
+mmlu_pro/mmlu_pro_business: {'sample_len': 25, 'exact_match,custom-extract': 0.84}  n=25
+mmlu_pro/mmlu_pro_chemistry: {'sample_len': 25, 'exact_match,custom-extract': 0.88}  n=25
+mmlu_pro/mmlu_pro_computer_science: {'sample_len': 25, 'exact_match,custom-extract': 0.88}  n=25
+mmlu_pro/mmlu_pro_economics: {'sample_len': 25, 'exact_match,custom-extract': 0.84}  n=25
+mmlu_pro/mmlu_pro_engineering: {'sample_len': 25, 'exact_match,custom-extract': 0.64}  n=25
+mmlu_pro/mmlu_pro_health: {'sample_len': 25, 'exact_match,custom-extract': 0.88}  n=25
+mmlu_pro/mmlu_pro_history: {'sample_len': 25, 'exact_match,custom-extract': 0.72}  n=25
+mmlu_pro/mmlu_pro_law: {'sample_len': 25, 'exact_match,custom-extract': 0.68}  n=25
+mmlu_pro/mmlu_pro_math: {'sample_len': 25, 'exact_match,custom-extract': 0.96}  n=25
+mmlu_pro/mmlu_pro_other: {'sample_len': 25, 'exact_match,custom-extract': 0.68}  n=25
+mmlu_pro/mmlu_pro_philosophy: {'sample_len': 25, 'exact_match,custom-extract': 0.76}  n=25
+mmlu_pro/mmlu_pro_physics: {'sample_len': 25, 'exact_match,custom-extract': 1.0}  n=25
+mmlu_pro/mmlu_pro_psychology: {'sample_len': 25, 'exact_match,custom-extract': 0.8}  n=25
+gsm8k (author protocol): {'error_rate': 0.0, 'score': 0.9742228961334344, 'stop_rate': 0.9909021986353298, 'truncated_rate': 0.009097801364670205}

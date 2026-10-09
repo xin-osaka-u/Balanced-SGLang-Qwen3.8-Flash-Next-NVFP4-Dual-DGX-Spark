@@ -1,0 +1,173 @@
+From 3b5da6944842c9f2c3ce28bb32ba6c5badbada21 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:02:17 +0900
+Subject: [PATCH 3/8] tune-20261008: skinny GEMM plan rows measured on GB10
+ (M=3, draft head M=2-4, (10240,2560), (2560,2560)); hook
+ apply_into/apply_with_addend
+
+---
+ .../kernels/ops/gemm/sm121_skinny_gemm.py     | 32 ++++++++++++++++---
+ .../sglang/srt/layers/quantization/unquant.py | 16 ++++++++++
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+index cb4b516a0a..25836d3ddc 100644
+--- a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
++++ b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+@@ -63,6 +63,7 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+         2: SkinnyGemmConfig(2, 64, 1, k_unroll=2, vector_width=4, static_k=2560),
+         4: SkinnyGemmConfig(4, 128, 1, vector_width=2, static_k=2560),
+         8: SkinnyGemmConfig(8, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+     },
+     # GDN fused B/A projection, TP=2.
+     (48, 2560): {
+@@ -71,6 +72,7 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+         4: SkinnyGemmConfig(4, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
+         8: SkinnyGemmConfig(8, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
+         16: SkinnyGemmConfig(16, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
+     },
+     # GDN fused B/A projection, TP=1.
+     (96, 2560): {
+@@ -86,12 +88,14 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+         2: SkinnyGemmConfig(2, 256, 1, k_unroll=4, vector_width=2, static_k=2560),
+         4: SkinnyGemmConfig(4, 64, 1, k_unroll=2, static_k=2560),
+         8: SkinnyGemmConfig(8, 64, 2, static_k=2560),
++        3: SkinnyGemmConfig(3, 64, 1, k_unroll=4, vector_width=4, static_k=2560),
+     },
+     # Shared-expert fused gate/up, TP=2.
+     (640, 2560): {
+         1: SkinnyGemmConfig(1, 256, 1, vector_width=2, static_k=2560),
+         2: SkinnyGemmConfig(2, 256, 1, vector_width=2, static_k=2560),
+         8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 64, 1, k_unroll=4, vector_width=4, static_k=2560),
+     },
+     # Shared-expert fused gate/up, TP=1.
+     (1280, 2560): {
+@@ -114,6 +118,7 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+         1: SkinnyGemmConfig(1, 128, 2, k_unroll=2, vector_width=4, static_k=3072),
+         2: SkinnyGemmConfig(2, 64, 2, k_unroll=2, static_k=3072),
+         4: SkinnyGemmConfig(4, 64, 2, k_unroll=2, static_k=3072),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=3072),
+     },
+     # GDN and QSA output projections, TP=1.
+     (2560, 6144): {
+@@ -128,12 +133,14 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+         1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
+         2: SkinnyGemmConfig(2, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
+         4: SkinnyGemmConfig(4, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+     },
+     # GDN fused QKVZ projection, TP=2.
+     (8192, 2560): {
+         1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+         2: SkinnyGemmConfig(2, 64, 2, k_unroll=2, static_k=2560),
+         4: SkinnyGemmConfig(4, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+     },
+     # HC up projection.
+     (10240, 320): {
+@@ -155,13 +162,24 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+         8: SkinnyGemmConfig(8, 64, 1, vector_width=2, static_k=2560),
+         16: SkinnyGemmConfig(16, 32, 1, k_unroll=2, vector_width=2, static_k=2560),
+     },
++    # Per-layer BF16 projection seen at verify (SGLang TP=2 fusion), measured 2026-10-08.
++    (10240, 2560): {
++        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++    },
++    (2560, 2560): {
++        4: SkinnyGemmConfig(4, 128, 2, k_unroll=4, vector_width=4),
++    },
+     # Hot-vocab NEXTN draft head (65,536-token map), TP=2: reuse the TP=2 LM head plan.
+     (32768, 2560): {
+         1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++        2: SkinnyGemmConfig(2, 32, 1, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 32, 1, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 32, 1, vector_width=4, static_k=2560),
+     },
+     # LM head, TP=2.
+     (124160, 2560): {
+         1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++        3: SkinnyGemmConfig(3, 64, 1, k_unroll=4, vector_width=4, static_k=2560),
+     },
+     # LM head, TP=1.
+     (248320, 2560): {
+@@ -277,14 +295,17 @@ class ShapeDynamicSkinnyGemm:
+         torch.cuda.synchronize()
+ 
+     def __call__(self, a: torch.Tensor, b: torch.Tensor, config: SkinnyGemmConfig,
+-                 residual: Optional[torch.Tensor] = None) -> torch.Tensor:
++                 residual: Optional[torch.Tensor] = None, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+         has_residual = residual is not None
+         key = (a.dtype, config, has_residual)
+         fn = self._compiled.get(key)
+         if fn is None:
+             with self._lock:
+                 fn = self._compiled.get(key) or self._compile(a.dtype, config, has_residual)
+-        output = torch.empty((a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device)
++        if out is not None and out.shape == (a.shape[0], b.shape[0]) and out.dtype == a.dtype and out.is_contiguous():
++            output = out
++        else:
++            output = torch.empty((a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device)
+         fn(a, b, output if residual is None else residual, output, self._stream())
+         return output
+ 
+@@ -331,7 +352,8 @@ def _note_miss(n: int, k: int, m: int) -> None:
+ 
+ 
+ def maybe_skinny_gemm(x: torch.Tensor, weight: torch.Tensor,
+-                      residual: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
++                      residual: Optional[torch.Tensor] = None,
++                      out: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+     """Run the skinny kernel if (N, K, M) has a measured plan; else None (caller uses cuBLAS)."""
+     if not sm121_skinny_enabled() or x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+         return None
+@@ -351,8 +373,8 @@ def maybe_skinny_gemm(x: torch.Tensor, weight: torch.Tensor,
+         residual = residual.reshape(m, n)
+         if not residual.is_contiguous() or residual.dtype != x.dtype:
+             residual = residual.contiguous().to(x.dtype)
+-    out = skinny_gemm(x2, weight, config, residual)
+-    return out if x.dim() == 2 else out.reshape(*x.shape[:-1], n)
++    res = skinny_gemm(x2, weight, config, residual, out if x.dim() == 2 else None)
++    return res if x.dim() == 2 else res.reshape(*x.shape[:-1], n)
+ 
+ 
+ _warmed: Set[Tuple[int, int]] = set()
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 288b36db9d..3ae174454d 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -523,6 +523,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         returning ``addend`` itself; the other routes add separately,
+         leaving it untouched. Callers must treat it as consumed either way.
+         """
++        if bias is None and _sm121_skinny_enabled() and x.is_cuda:
++            out = _maybe_skinny_gemm(x, layer.weight)
++            if out is not None:
++                return out.add_(addend)
+         if _can_accumulate_into_addend(
+             weight=layer.weight, x=x, addend=addend, bias=bias
+         ):
+@@ -537,6 +541,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         bias: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+         """Run an inference-only BF16 linear into caller-owned storage."""
++        if (
++            bias is None
++            and _sm121_skinny_enabled()
++            and x.is_cuda
++            and x.ndim == 2
++            and output.dtype == torch.bfloat16
++            and output.is_contiguous()
++            and output.shape == (x.shape[0], layer.weight.shape[0])
++        ):
++            out = _maybe_skinny_gemm(x, layer.weight, out=output)
++            if out is not None:
++                return out
+         if (
+             _enable_bf16_splitk_gemm
+             and bias is None
+-- 
+2.43.0
+

@@ -1,0 +1,502 @@
+From b742965e9f036051aba3e646a2ee004cdc716c4d Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 21:17:33 +0900
+Subject: [PATCH 6/8] PLE file backend: static reuse across restarts
+ (fingerprint sidecar after msync/fsync, read-only mapping on reuse, per-shard
+ content check); sampling check after shantanugoel/ple_reuse.py (Apache-2.0)
+
+---
+ .../load_model_utils.py                       |   1 +
+ python/sglang/srt/models/qwen4_exp.py         | 103 +++++++-
+ .../sglang/srt/models/qwen4_exp_ple_reuse.py  | 248 ++++++++++++++++++
+ .../sglang/srt/models/qwen4_exp_ple_table.py  |  39 ++-
+ 4 files changed, 376 insertions(+), 15 deletions(-)
+ create mode 100644 python/sglang/srt/models/qwen4_exp_ple_reuse.py
+
+diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+index c978df0eed..6223659f9c 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
++++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+@@ -278,6 +278,7 @@ def load_model_with_memory_saver(
+             model_config.hf_text_config.ple_offload_backend = (
+                 get_exec().offload.ple_offload_backend
+             )
++            model_config.hf_text_config.ple_model_path = model_config.model_path
+             if get_exec().offload.ple_offload_backend != "file":
+                 model_config.hf_text_config.ple_offload_dir = (
+                     get_exec().offload.ple_offload_dir
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 0894eac174..8d691ea9c9 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -625,6 +625,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                 ngram_embedding,
+                 backend=getattr(config, "ple_offload_backend", "pinned"),
+                 table_dir=getattr(config, "ple_offload_dir", None),
++                model_path=getattr(config, "ple_model_path", None),
+             )
+         self.ngram_embedding = ngram_embedding
+ 
+@@ -905,6 +906,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+         *,
+         backend: str = "pinned",
+         table_dir: Optional[str] = None,
++        model_path: Optional[str] = None,
+     ) -> None:
+         nn.Module.__init__(self)
+         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
+@@ -927,17 +929,44 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+         self.quant_method = None
+ 
+         source_weight = embedding.weight
++        tag = (
++            f"rows{self.shard_indices.org_vocab_start_index}"
++            f"-{self.shard_indices.org_vocab_end_index}"
++        )
++        fingerprint = None
++        if backend == "file":
++            from sglang.srt.models import qwen4_exp_ple_reuse as _reuse
++            from sglang.srt.models import qwen4_exp_ple_table as _table_mod
++
++            fingerprint = _reuse.compute_fingerprint(
++                model_path=model_path,
++                shape=source_weight.shape,
++                dtype=source_weight.dtype,
++                tag=tag,
++                tp_size=int(self.tp_size),
++                tp_rank=int(
++                    self.shard_indices.org_vocab_start_index
++                    // max(1, int(self.num_embeddings_per_partition))
++                ),
++                loader_sources=(__file__, _table_mod.__file__, _reuse.__file__),
++            )
+         host_table = allocate_ple_host_table(
+             shape=source_weight.shape,
+             dtype=source_weight.dtype,
+             backend=backend,
+             table_dir=table_dir,
+             # Each TP rank holds a different vocabulary shard of the same shape.
+-            tag=(
+-                f"rows{self.shard_indices.org_vocab_start_index}"
+-                f"-{self.shard_indices.org_vocab_end_index}"
+-            ),
+-        )
++            tag=tag,
++            fingerprint=fingerprint,
++        )
++        self._ple_backend = backend
++        self._ple_reused = bool(getattr(host_table, "_sglang_ple_reused", False))
++        self._ple_fingerprint = getattr(host_table, "_sglang_ple_fingerprint", None)
++        self._ple_storage = getattr(host_table, "_sglang_ple_storage", None)
++        self._ple_keepalive = getattr(host_table, "_sglang_ple_keepalive", None)
++        self._ple_file_path = getattr(host_table, "_sglang_ple_file_path", None)
++        self._ple_stats = {"copied": 0, "verified": 0, "rows": 0}
++        self._ple_finalized = False
+         # Only the file backend has anything to prefetch (rows live on storage).
+         self._file_prefetcher = make_ple_file_prefetcher(host_table)
+         # ... and only it needs its resident set bounded: a fault maps a whole
+@@ -954,6 +983,37 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+         del embedding.weight
+         self._block_d = triton.next_power_of_2(self.embedding_dim)
+ 
++    def finalize_ple_table(self) -> None:
++        """After a rebuild: flush the table to disk and publish the sidecar."""
++        if (
++            self._ple_backend != "file"
++            or self._ple_finalized
++            or self._ple_fingerprint is None
++            or self._ple_storage is None
++        ):
++            return
++        from sglang.srt.models import qwen4_exp_ple_reuse as _reuse
++
++        if self._ple_reused:
++            logger.info(
++                "PLE table: reused %s, %d/%d shards verified against the checkpoint (%d rows), 0 written",
++                self._ple_file_path,
++                self._ple_stats["verified"],
++                self._ple_stats["verified"] + self._ple_stats["copied"],
++                self._ple_stats["rows"],
++            )
++        else:
++            _reuse.finalize_build(
++                self._ple_storage, self._ple_file_path, self._ple_fingerprint, dict(self._ple_stats)
++            )
++            logger.info(
++                "PLE table: built %s (%d shards, %d rows), flushed, sidecar written",
++                self._ple_file_path,
++                self._ple_stats["copied"],
++                self._ple_stats["rows"],
++            )
++        self._ple_finalized = True
++
+     def allocate_output(
+         self, shape: Tuple[int, ...], device: torch.device
+     ) -> torch.Tensor:
+@@ -2165,11 +2225,31 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                 local_start = ov_start - tp_start
+                 src_start = ov_start - row_start
+                 n_rows = ov_end - ov_start
+-                emb.weight.data[local_start : local_start + n_rows].copy_(
+-                    loaded_weight[src_start : src_start + n_rows].to(
+-                        device=emb.weight.device, dtype=emb.weight.dtype
+-                    )
++                dst = emb.weight.data[local_start : local_start + n_rows]
++                src = loaded_weight[src_start : src_start + n_rows].to(
++                    device=emb.weight.device, dtype=emb.weight.dtype
+                 )
++                stats = getattr(emb, "_ple_stats", None)
++                if getattr(emb, "_ple_reused", False):
++                    from sglang.srt.models import qwen4_exp_ple_reuse as _reuse
++
++                    if not _reuse.shard_matches(dst, src):
++                        path = getattr(emb, "_ple_file_path", "?")
++                        _reuse.remove_sidecar(path)
++                        raise RuntimeError(
++                            "PLE table reuse: on-disk rows differ from the checkpoint "
++                            f"(table {path}, rows {local_start}-{local_start + n_rows}). "
++                            "The sidecar was removed; restart to rebuild the table, or "
++                            "set SGLANG_QWEN4_PLE_REUSE=0."
++                        )
++                    if stats is not None:
++                        stats["verified"] += 1
++                        stats["rows"] += n_rows
++                else:
++                    dst.copy_(src)
++                    if stats is not None:
++                        stats["copied"] += 1
++                        stats["rows"] += n_rows
+ 
+         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
+             if ".ngram_embedding.shard_" not in name:
+@@ -2433,6 +2513,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+         loaded_params.update(loaded_buffers)
+         loaded_params.update(loaded_shard_params)
+ 
++        for ple_mod in ple_modules.values():
++            finalize = getattr(ple_mod.ngram_embedding, "finalize_ple_table", None)
++            if finalize is not None:
++                finalize()
++
+         if skipped_visual_count > 0:
+             logger.info(
+                 f"[language_model_only] Qwen4 load_weights: skipped "
+diff --git a/python/sglang/srt/models/qwen4_exp_ple_reuse.py b/python/sglang/srt/models/qwen4_exp_ple_reuse.py
+new file mode 100644
+index 0000000000..7d557d62e9
+--- /dev/null
++++ b/python/sglang/srt/models/qwen4_exp_ple_reuse.py
+@@ -0,0 +1,248 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Reuse a file-backed Qwen4Exp PLE table across restarts instead of rewriting it.
++
++The native file backend (``--ple-offload-backend file``) keeps the n-gram table
++in a sparse file but rewrites all of it through the weight loader on every
++boot (25.6 GiB per TP rank here). This module adds:
++
++* a **fingerprint sidecar** ``<table>.meta.json`` written only after the table
++  bytes are ``msync``'d and ``fsync``'d (temp file + atomic rename), carrying
++  the checkpoint identity (config / quant-config hashes, the PLE shard files'
++  name+size+mtime), the table geometry, TP size and rank, the SGLang version
++  and a hash of the loader code that produces the table;
++* a **read-only mapping** (``PROT_READ``) when the sidecar matches, so a reuse
++  boot cannot write a single byte to the SSD;
++* a **per-shard content check** on reuse: 32 random 4 KiB windows plus the two
++  ends of each shard are compared against the checkpoint tensor (the same
++  idea as shantanugoel's ``ple_reuse.py``, Apache-2.0). A mismatch aborts the
++  boot with a clear message instead of serving a stale table.
++
++Every rank verifies its own rows against the checkpoint, so two ranks can never
++disagree on content even if one rebuilds while the other reuses.
++
++Env:
++  SGLANG_QWEN4_PLE_REUSE=0           force a rebuild (sidecar is removed first)
++  SGLANG_QWEN4_PLE_REUSE_WINDOWS=N   sampled windows per shard (default 32)
++"""
++from __future__ import annotations
++
++import ctypes
++import hashlib
++import json
++import logging
++import mmap
++import os
++import struct
++import warnings
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++SCHEMA = 1
++_MS_SYNC = 4
++
++
++def reuse_enabled() -> bool:
++    return os.environ.get("SGLANG_QWEN4_PLE_REUSE", "1").strip() != "0"
++
++
++def sidecar_path(table_path: str) -> str:
++    return table_path + ".meta.json"
++
++
++def _sha256_file(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def _ple_checkpoint_files(model_path: str) -> List[List[Any]]:
++    """[name, size, mtime_ns] of every safetensors file holding n-gram shards.
++
++    Only the 8-byte length prefix and the JSON header of each file are read.
++    """
++    out: List[List[Any]] = []
++    try:
++        names = sorted(n for n in os.listdir(model_path) if n.endswith(".safetensors"))
++    except OSError:
++        return out
++    for n in names:
++        p = os.path.join(model_path, n)
++        try:
++            with open(p, "rb") as f:
++                hdr_len = struct.unpack("<Q", f.read(8))[0]
++                hdr = json.loads(f.read(hdr_len))
++        except Exception:  # noqa: BLE001
++            continue
++        if any("ngram_embedding" in k for k in hdr):
++            st = os.stat(p)
++            out.append([n, int(st.st_size), int(st.st_mtime_ns)])
++    return out
++
++
++def compute_fingerprint(
++    *,
++    model_path: Optional[str],
++    shape: Sequence[int],
++    dtype: torch.dtype,
++    tag: Optional[str],
++    tp_size: int,
++    tp_rank: int,
++    loader_sources: Sequence[str],
++    extra: Optional[Dict[str, Any]] = None,
++) -> Dict[str, Any]:
++    fp: Dict[str, Any] = {
++        "schema": SCHEMA,
++        "table": {
++            "shape": [int(d) for d in shape],
++            "dtype": str(dtype).replace("torch.", ""),
++            "tag": tag or "",
++        },
++        "tp_size": int(tp_size),
++        "tp_rank": int(tp_rank),
++    }
++    if model_path and os.path.isdir(model_path):
++        fp["model_path"] = os.path.realpath(model_path)
++        for fn in ("config.json", "hf_quant_config.json"):
++            p = os.path.join(model_path, fn)
++            fp[fn] = _sha256_file(p) if os.path.exists(p) else None
++        fp["ple_files"] = _ple_checkpoint_files(model_path)
++    else:
++        fp["model_path"] = model_path
++    h = hashlib.sha256()
++    for src in loader_sources:
++        try:
++            with open(src, "rb") as f:
++                h.update(f.read())
++        except OSError:
++            h.update(b"missing:" + src.encode())
++    fp["loader_code_sha256"] = h.hexdigest()
++    try:
++        from sglang.version import __version__ as sgl_version
++    except Exception:  # noqa: BLE001
++        sgl_version = "unknown"
++    fp["sglang_version"] = sgl_version
++    if extra:
++        fp["extra"] = extra
++    return fp
++
++
++def read_sidecar(table_path: str) -> Optional[Dict[str, Any]]:
++    p = sidecar_path(table_path)
++    try:
++        with open(p, "r", encoding="utf-8") as f:
++            return json.load(f)
++    except (OSError, ValueError):
++        return None
++
++
++def sidecar_matches(meta: Optional[Dict[str, Any]], fp: Dict[str, Any], table_path: str, nbytes: int) -> Tuple[bool, str]:
++    if meta is None:
++        return False, "no sidecar"
++    if not meta.get("complete"):
++        return False, "sidecar not marked complete"
++    if meta.get("fingerprint") != fp:
++        diff = [k for k in set(meta.get("fingerprint", {})) | set(fp) if meta.get("fingerprint", {}).get(k) != fp.get(k)]
++        return False, f"fingerprint differs in {sorted(diff)}"
++    try:
++        size = os.path.getsize(table_path)
++    except OSError:
++        return False, "table file missing"
++    if size != nbytes:
++        return False, f"table size {size} != {nbytes}"
++    return True, "ok"
++
++
++def map_table(table_path: str, nbytes: int, reuse: bool) -> Tuple[torch.Tensor, Optional[mmap.mmap]]:
++    """Map the table file; read-only when reusing."""
++    if not reuse:
++        if not os.path.exists(table_path) or os.path.getsize(table_path) != nbytes:
++            with open(table_path, "wb") as f:
++                f.truncate(nbytes)  # sparse
++        storage = torch.from_file(table_path, shared=True, size=nbytes, dtype=torch.uint8)
++        return storage, None
++    fd = os.open(table_path, os.O_RDONLY)
++    try:
++        mm = mmap.mmap(fd, nbytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
++    finally:
++        os.close(fd)  # the mapping keeps its own reference
++    with warnings.catch_warnings():
++        warnings.filterwarnings("ignore", message="The given buffer is not writable")
++        storage = torch.frombuffer(mm, dtype=torch.uint8)
++    return storage, mm
++
++
++def _libc() -> Optional[ctypes.CDLL]:
++    try:
++        return ctypes.CDLL("libc.so.6", use_errno=True)
++    except OSError:
++        return None
++
++
++def finalize_build(storage: torch.Tensor, table_path: str, fp: Dict[str, Any], stats: Dict[str, int]) -> None:
++    """Flush the freshly written table to disk, then publish the sidecar atomically."""
++    libc = _libc()
++    if libc is not None:
++        libc.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
++        libc.msync.restype = ctypes.c_int
++        addr = storage.data_ptr()
++        page = mmap.PAGESIZE
++        aligned = addr - (addr % page)
++        length = storage.numel() + (addr - aligned)
++        rc = libc.msync(ctypes.c_void_p(aligned), ctypes.c_size_t(length), _MS_SYNC)
++        if rc != 0:
++            raise OSError(ctypes.get_errno(), "msync of the PLE table failed")
++    fd = os.open(table_path, os.O_RDONLY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++    meta = {"complete": True, "fingerprint": fp, "stats": stats, "written_by": "qwen4_exp_ple_reuse", "schema": SCHEMA}
++    final = sidecar_path(table_path)
++    tmp = final + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(meta, f, indent=1, sort_keys=True)
++        f.flush()
++        os.fsync(f.fileno())
++    os.replace(tmp, final)
++    dfd = os.open(os.path.dirname(final) or ".", os.O_RDONLY)
++    try:
++        os.fsync(dfd)
++    finally:
++        os.close(dfd)
++
++
++def remove_sidecar(table_path: str) -> None:
++    for p in (sidecar_path(table_path), sidecar_path(table_path) + ".tmp"):
++        try:
++            os.remove(p)
++        except FileNotFoundError:
++            pass
++
++
++def shard_matches(dst: torch.Tensor, src: torch.Tensor) -> bool:
++    """True when ``dst`` already holds ``src``, by sampled 4 KiB windows plus both ends."""
++    if dst.shape != src.shape or dst.dtype != src.dtype:
++        return False
++    if dst.numel() == 0:
++        return True
++    a = dst.reshape(-1).view(torch.uint8)
++    b = src.reshape(-1).contiguous().view(torch.uint8)
++    n = int(a.numel())
++    win = 4096
++    if n <= win * 2:
++        return bool(torch.equal(a, b))
++    try:
++        k = max(4, int(os.environ.get("SGLANG_QWEN4_PLE_REUSE_WINDOWS", "32")))
++    except ValueError:
++        k = 32
++    gen = torch.Generator().manual_seed(0x5150 ^ n)
++    offs = (torch.randint(0, (n - win) // win, (k,), generator=gen) * win).tolist()
++    for o in sorted(set(offs + [0, n - win])):
++        if not torch.equal(a[o : o + win], b[o : o + win]):
++            return False
++    return True
+diff --git a/python/sglang/srt/models/qwen4_exp_ple_table.py b/python/sglang/srt/models/qwen4_exp_ple_table.py
+index 2e7a02c0ac..fffc0b28ee 100644
+--- a/python/sglang/srt/models/qwen4_exp_ple_table.py
++++ b/python/sglang/srt/models/qwen4_exp_ple_table.py
+@@ -228,6 +228,7 @@ def allocate_ple_host_table(
+     backend: str = "pinned",
+     table_dir: Optional[str] = None,
+     tag: Optional[str] = None,
++    fingerprint: Optional[dict] = None,
+ ) -> torch.Tensor:
+     """Return a host tensor of ``shape``/``dtype`` for the PLE table.
+ 
+@@ -250,17 +251,43 @@ def allocate_ple_host_table(
+     table_dir = os.path.expanduser(table_dir or envs.SGLANG_QWEN4_PLE_FILE_DIR.get())
+     os.makedirs(table_dir, exist_ok=True)
+     path = os.path.join(table_dir, ple_table_file_name(shape, dtype, tag))
+-    if not os.path.exists(path) or os.path.getsize(path) != nbytes:
+-        # Sparse: only pages that get written take disk space.
+-        with open(path, "wb") as f:
+-            f.truncate(nbytes)
++    reuse = False
++    reuse_reason = "no fingerprint"
++    if fingerprint is not None:
++        from sglang.srt.models import qwen4_exp_ple_reuse as _reuse
++
++        if not _reuse.reuse_enabled():
++            _reuse.remove_sidecar(path)
++            reuse_reason = "SGLANG_QWEN4_PLE_REUSE=0"
++        else:
++            reuse, reuse_reason = _reuse.sidecar_matches(
++                _reuse.read_sidecar(path), fingerprint, path, nbytes
++            )
++            if not reuse:
++                # A stale sidecar must not survive a rebuild that may be interrupted.
++                _reuse.remove_sidecar(path)
++        storage, keepalive = _reuse.map_table(path, nbytes, reuse)
++    else:
++        if not os.path.exists(path) or os.path.getsize(path) != nbytes:
++            # Sparse: only pages that get written take disk space.
++            with open(path, "wb") as f:
++                f.truncate(nbytes)
++        storage = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
++        keepalive = None
+     logger.info(
+-        "PLE table: file-backed mmap %s (%.1f GiB, %s)", path, nbytes / 2**30, dtype
++        "PLE table: file-backed mmap %s (%.1f GiB, %s) %s",
++        path,
++        nbytes / 2**30,
++        dtype,
++        "REUSED read-only (sidecar matches)" if reuse else f"rebuild ({reuse_reason})",
+     )
+-    storage = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
+     _madvise_random(storage, nbytes)
+     table = storage.view(dtype).view(*[int(d) for d in shape])
+     table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
++    table._sglang_ple_reused = reuse
++    table._sglang_ple_fingerprint = fingerprint
++    table._sglang_ple_storage = storage
++    table._sglang_ple_keepalive = keepalive
+     return table
+ 
+ 
+-- 
+2.43.0
+

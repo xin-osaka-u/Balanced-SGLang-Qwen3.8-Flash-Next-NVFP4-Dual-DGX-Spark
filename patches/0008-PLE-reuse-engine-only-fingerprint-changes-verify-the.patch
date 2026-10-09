@@ -1,0 +1,105 @@
+From cb51259d63bab0dcac73261f750f6ebc2fc39158 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 21:44:05 +0900
+Subject: [PATCH 8/8] PLE reuse: engine-only fingerprint changes verify the old
+ table instead of rebuilding
+
+sglang_version and loader_code_sha256 are soft keys: when only they differ the
+table is still mapped read-only and every shard is verified against the
+checkpoint; the sidecar is refreshed afterwards. Model-side changes rebuild.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/models/qwen4_exp.py         |  4 +++
+ .../sglang/srt/models/qwen4_exp_ple_reuse.py  | 33 +++++++++++++++++--
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 8d691ea9c9..f71019b000 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -1002,6 +1002,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+                 self._ple_stats["verified"] + self._ple_stats["copied"],
+                 self._ple_stats["rows"],
+             )
++            if _reuse.refresh_sidecar_if_changed(
++                self._ple_file_path, self._ple_fingerprint, dict(self._ple_stats)
++            ):
++                logger.info("PLE table: sidecar fingerprint refreshed after an engine change")
+         else:
+             _reuse.finalize_build(
+                 self._ple_storage, self._ple_file_path, self._ple_fingerprint, dict(self._ple_stats)
+diff --git a/python/sglang/srt/models/qwen4_exp_ple_reuse.py b/python/sglang/srt/models/qwen4_exp_ple_reuse.py
+index f5d8332eaa..c0075a6beb 100644
+--- a/python/sglang/srt/models/qwen4_exp_ple_reuse.py
++++ b/python/sglang/srt/models/qwen4_exp_ple_reuse.py
+@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
+ SCHEMA = 1
+ _MS_SYNC = 4
+ 
++# Fingerprint keys that describe the *engine*, not the table's content. When only
++# these differ, the old table is still mapped read-only and verified shard by shard
++# against the checkpoint (the normal reuse path); it is rebuilt only if that
++# verification fails. Everything else (checkpoint files, config hashes, geometry,
++# TP size/rank) rebuilds immediately.
++SOFT_KEYS = ("sglang_version", "loader_code_sha256")
++
+ 
+ def reuse_enabled() -> bool:
+     return os.environ.get("SGLANG_QWEN4_PLE_REUSE", "1").strip() != "0"
+@@ -145,15 +152,19 @@ def sidecar_matches(meta: Optional[Dict[str, Any]], fp: Dict[str, Any], table_pa
+         return False, "no sidecar"
+     if not meta.get("complete"):
+         return False, "sidecar not marked complete"
+-    if meta.get("fingerprint") != fp:
+-        diff = [k for k in set(meta.get("fingerprint", {})) | set(fp) if meta.get("fingerprint", {}).get(k) != fp.get(k)]
+-        return False, f"fingerprint differs in {sorted(diff)}"
++    old = meta.get("fingerprint") or {}
++    diff = sorted(k for k in set(old) | set(fp) if old.get(k) != fp.get(k))
++    hard = [k for k in diff if k not in SOFT_KEYS]
++    if hard:
++        return False, f"fingerprint differs in {hard}"
+     try:
+         size = os.path.getsize(table_path)
+     except OSError:
+         return False, "table file missing"
+     if size != nbytes:
+         return False, f"table size {size} != {nbytes}"
++    if diff:
++        return True, f"engine changed ({', '.join(diff)}); old table kept and verified against the checkpoint"
+     return True, "ok"
+ 
+ 
+@@ -204,6 +215,10 @@ def finalize_build(storage: torch.Tensor, table_path: str, fp: Dict[str, Any], s
+     finally:
+         os.close(fd)
+     meta = {"complete": True, "fingerprint": fp, "stats": stats, "written_by": "qwen4_exp_ple_reuse", "schema": SCHEMA}
++    _write_sidecar(table_path, meta)
++
++
++def _write_sidecar(table_path: str, meta: Dict[str, Any]) -> None:
+     final = sidecar_path(table_path)
+     tmp = final + ".tmp"
+     with open(tmp, "w", encoding="utf-8") as f:
+@@ -218,6 +233,18 @@ def finalize_build(storage: torch.Tensor, table_path: str, fp: Dict[str, Any], s
+         os.close(dfd)
+ 
+ 
++def refresh_sidecar_if_changed(table_path: str, fp: Dict[str, Any], stats: Dict[str, int]) -> bool:
++    """After a verified reuse: record the current engine fingerprint so the next boot matches exactly."""
++    meta = read_sidecar(table_path)
++    if meta is None or meta.get("fingerprint") == fp:
++        return False
++    meta = dict(meta)
++    meta["fingerprint"] = fp
++    meta["verified_stats"] = stats
++    _write_sidecar(table_path, meta)
++    return True
++
++
+ def remove_sidecar(table_path: str) -> None:
+     for p in (sidecar_path(table_path), sidecar_path(table_path) + ".tmp"):
+         try:
+-- 
+2.43.0
+

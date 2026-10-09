@@ -1,0 +1,810 @@
+From 68b6514f6fa2d3ff14121376632505af44be4702 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:27:05 +0900
+Subject: [PATCH 2/8] tune-20261008: sm121 skinny BF16 GEMM (ported from vLLM)
+ for decode projections + lm_head; TP-aware hot-token draft head slicing
+
+---
+ .../kernels/ops/gemm/_sm121_skinny_kernel.py  | 254 ++++++++++++
+ .../kernels/ops/gemm/sm121_skinny_gemm.py     | 386 ++++++++++++++++++
+ python/sglang/srt/layers/logits_processor.py  |  15 +-
+ .../sglang/srt/layers/quantization/unquant.py |  10 +
+ .../sglang/srt/model_executor/model_runner.py |   3 +
+ .../sglang/srt/speculative/eagle_worker_v2.py |  45 +-
+ 6 files changed, 707 insertions(+), 6 deletions(-)
+ create mode 100644 python/sglang/kernels/ops/gemm/_sm121_skinny_kernel.py
+ create mode 100644 python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+
+diff --git a/python/sglang/kernels/ops/gemm/_sm121_skinny_kernel.py b/python/sglang/kernels/ops/gemm/_sm121_skinny_kernel.py
+new file mode 100644
+index 0000000000..4625bb5a46
+--- /dev/null
++++ b/python/sglang/kernels/ops/gemm/_sm121_skinny_kernel.py
+@@ -0,0 +1,254 @@
++# SPDX-License-Identifier: Apache-2.0
++# Ported verbatim from vLLM (Copyright contributors to the vLLM project):
++#   vllm/model_executor/kernels/linear/cute_dsl/_skinny_gemm.py
++
++from __future__ import annotations
++
++import cutlass
++import cutlass.cute as cute
++from cuda.bindings.driver import CUstream
++from cutlass import const_expr
++
++_PREFETCH_TILES = 2
++
++
++class CuteSkinnyGemm:
++    """Shape-dynamic low-latency GEMM for small token counts.
++
++    Computes ``C[M, N] = A[M, K] @ B[N, K].T + residual`` with BF16 or FP16
++    inputs, FP32 accumulators, and an output matching the input dtype. The
++    residual term is optional and is added before the output conversion. N and
++    K are runtime values unless the configuration specializes K at compile
++    time. The tiny M dimension is fully unrolled alongside a small set of
++    tuning parameters.
++    """
++
++    def __init__(
++        self,
++        *,
++        element_type,
++        num_rows: int,
++        block_size: int,
++        outputs_per_block: int,
++        vector_width: int = 8,
++        k_unroll: int = 1,
++        has_residual: bool = False,
++        use_pdl: bool = False,
++        static_k: int | None = None,
++    ) -> None:
++        if block_size % cute.arch.WARP_SIZE != 0:
++            raise ValueError("block_size must be a multiple of the warp size")
++        k_tile_size = block_size * vector_width
++        if static_k is not None and (
++            static_k % k_tile_size or static_k < _PREFETCH_TILES * k_tile_size
++        ):
++            raise ValueError("static K must contain at least two complete tiles")
++        self.element_type = element_type
++        self.num_rows = num_rows
++        self.block_size = block_size
++        self.outputs_per_block = outputs_per_block
++        self.vector_width = vector_width
++        self.k_unroll = k_unroll
++        self.has_residual = has_residual
++        self.use_pdl = use_pdl
++        self.static_k = static_k
++        self.num_warps = block_size // cute.arch.WARP_SIZE
++
++    @cute.jit
++    def __call__(
++        self,
++        gA: cute.Tensor,
++        gB: cute.Tensor,
++        gResidual: cute.Tensor,
++        gC: cute.Tensor,
++        stream: CUstream,
++    ) -> None:
++        n = cute.size(gB, mode=[0])
++        k = cute.size(gA, mode=[1])
++        copy_a = cute.make_copy_atom(
++            cute.nvgpu.CopyG2ROp(),
++            self.element_type,
++            num_bits_per_copy=self.vector_width * self.element_type.width,
++            load_cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS,
++        )
++        copy_b = cute.make_copy_atom(
++            cute.nvgpu.CopyG2ROp(),
++            self.element_type,
++            num_bits_per_copy=self.vector_width * self.element_type.width,
++            load_cache_mode=cute.nvgpu.LoadCacheMode.STREAMING,
++        )
++        copy_b_prefetch = cute.make_copy_atom(
++            cute.nvgpu.CopyG2ROp(),
++            self.element_type,
++            num_bits_per_copy=self.vector_width * self.element_type.width,
++            load_cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS,
++        )
++        self.kernel(
++            gA,
++            gB,
++            gResidual,
++            gC,
++            k,
++            copy_a,
++            copy_b,
++            copy_b_prefetch,
++        ).launch(
++            grid=[cute.ceil_div(n, self.outputs_per_block), 1, 1],
++            block=[self.block_size, 1, 1],
++            smem=self.num_rows * self.outputs_per_block * self.num_warps * 4,
++            stream=stream,
++            use_pdl=self.use_pdl,
++            min_blocks_per_mp=1,
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        gA: cute.Tensor,
++        gB: cute.Tensor,
++        gResidual: cute.Tensor,
++        gC: cute.Tensor,
++        k_extent: cutlass.Int32,
++        copy_a: cute.CopyAtom,
++        copy_b: cute.CopyAtom,
++        copy_b_prefetch: cute.CopyAtom,
++    ) -> None:
++        tidx, _, _ = cute.arch.thread_idx()
++        block_idx, _, _ = cute.arch.block_idx()
++        warp_idx = cute.arch.warp_idx()
++
++        num_rows: cutlass.Constexpr = self.num_rows
++        outputs_per_block: cutlass.Constexpr = self.outputs_per_block
++        vector_width: cutlass.Constexpr = self.vector_width
++        block_size: cutlass.Constexpr = self.block_size
++        num_warps: cutlass.Constexpr = self.num_warps
++
++        acc_layout = cute.make_layout(
++            (num_rows, outputs_per_block), stride=(outputs_per_block, 1)
++        )
++        acc = cute.make_rmem_tensor(acc_layout, cutlass.Float32)
++        acc.fill(0.0)
++
++        n_base = block_idx * outputs_per_block
++        k_tile_size: cutlass.Constexpr = block_size * vector_width
++
++        gA_vec = cute.logical_divide(gA, (None, vector_width))
++        gB_vec = cute.logical_divide(gB, (None, vector_width))
++        # Layout after both divides is (M/N, K_TILE, K_LANE, K_VEC).
++        tA_all = cute.logical_divide(gA_vec, (None, (None, block_size)))
++        tB_all = cute.logical_divide(gB_vec, (None, (None, block_size)))
++        tA = tA_all[None, (None, (tidx, None))]
++
++        a_regs = cute.make_rmem_tensor(
++            cute.make_layout((num_rows, vector_width), stride=(vector_width, 1)),
++            self.element_type,
++        )
++        b_regs = cute.make_rmem_tensor(
++            cute.make_layout(
++                (outputs_per_block, vector_width), stride=(vector_width, 1)
++            ),
++            self.element_type,
++        )
++
++        if const_expr(self.static_k is not None):
++            num_k_tiles: cutlass.Constexpr = self.static_k // k_tile_size
++            prefetched_b = cute.make_rmem_tensor(
++                cute.make_layout(
++                    (_PREFETCH_TILES, outputs_per_block, vector_width),
++                    stride=(outputs_per_block * vector_width, vector_width, 1),
++                ),
++                self.element_type,
++            )
++            for k_tile in cutlass.range_constexpr(_PREFETCH_TILES):
++                for ni in cutlass.range_constexpr(outputs_per_block):
++                    tB_static = tB_all[n_base + ni, (None, (tidx, None))]
++                    cute.copy(
++                        copy_b_prefetch,
++                        tB_static[None, k_tile],
++                        prefetched_b[k_tile, ni, None],
++                    )
++
++            if const_expr(self.use_pdl):
++                cute.arch.griddepcontrol_wait()
++
++            for k_tile in cutlass.range_constexpr(num_k_tiles):
++                if const_expr(k_tile < _PREFETCH_TILES):
++                    b_f32 = prefetched_b[k_tile, None, None].load().to(cutlass.Float32)
++                else:
++                    for ni in cutlass.range_constexpr(outputs_per_block):
++                        tB_static = tB_all[n_base + ni, (None, (tidx, None))]
++                        cute.copy(
++                            copy_b,
++                            tB_static[None, k_tile],
++                            b_regs[ni, None],
++                        )
++                    b_f32 = b_regs.load().to(cutlass.Float32)
++
++                for mi in cutlass.range_constexpr(num_rows):
++                    cute.copy(copy_a, tA[mi, None, k_tile], a_regs[mi, None])
++                a_f32 = a_regs.load().to(cutlass.Float32)
++
++                for vi in cutlass.range_constexpr(vector_width):
++                    for mi in cutlass.range_constexpr(num_rows):
++                        for ni in cutlass.range_constexpr(outputs_per_block):
++                            acc[mi, ni] += a_f32[mi, vi] * b_f32[ni, vi]
++        else:
++            if const_expr(self.use_pdl):
++                cute.arch.griddepcontrol_wait()
++
++            num_k_tiles = k_extent // k_tile_size
++            for k_tile in cutlass.range(num_k_tiles, unroll=self.k_unroll):
++                for mi in cutlass.range_constexpr(num_rows):
++                    cute.copy(copy_a, tA[mi, None, k_tile], a_regs[mi, None])
++
++                for ni in cutlass.range_constexpr(outputs_per_block):
++                    n_idx = n_base + ni
++                    tB_dynamic = tB_all[n_idx, (None, (tidx, None))]
++                    cute.copy(
++                        copy_b,
++                        tB_dynamic[None, k_tile],
++                        b_regs[ni, None],
++                    )
++
++                for vi in cutlass.range_constexpr(vector_width):
++                    for mi in cutlass.range_constexpr(num_rows):
++                        for ni in cutlass.range_constexpr(outputs_per_block):
++                            acc[mi, ni] = acc[mi, ni] + a_regs[mi, vi].to(
++                                cutlass.Float32
++                            ) * b_regs[ni, vi].to(cutlass.Float32)
++
++        for mi in cutlass.range_constexpr(num_rows):
++            for ni in cutlass.range_constexpr(outputs_per_block):
++                acc[mi, ni] = cute.arch.warp_reduction_sum(acc[mi, ni])
++
++        smem_layout = cute.make_layout(
++            (num_rows, outputs_per_block, num_warps),
++            stride=(outputs_per_block * num_warps, num_warps, 1),
++        )
++        smem = cutlass.utils.SmemAllocator()
++        partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
++        with cute.arch.elect_one():
++            for mi in cutlass.range_constexpr(num_rows):
++                for ni in cutlass.range_constexpr(outputs_per_block):
++                    partials[mi, ni, warp_idx] = acc[mi, ni]
++
++        cute.arch.sync_threads()
++        if tidx == 0:
++            for mi in cutlass.range_constexpr(num_rows):
++                for ni in cutlass.range_constexpr(outputs_per_block):
++                    n_idx = n_base + ni
++                    total = (
++                        partials[mi, ni, None]
++                        .load()
++                        .reduce(
++                            cute.ReductionOp.ADD,
++                            init_val=cutlass.Float32(0.0),
++                            reduction_profile=0,
++                        )
++                    )
++                    if const_expr(self.has_residual):
++                        total += gResidual[mi, n_idx].to(cutlass.Float32)
++                    gC[mi, n_idx] = cutlass.Float32(total).to(self.element_type)
++
++        if const_expr(self.use_pdl):
++            cute.arch.griddepcontrol_launch_dependents()
+diff --git a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+new file mode 100644
+index 0000000000..cb4b516a0a
+--- /dev/null
++++ b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+@@ -0,0 +1,386 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Low-latency BF16 skinny GEMM for DGX Spark (GB10, sm_121) decode shapes.
++
++cuBLAS on sm_121 serves small-M BF16 GEMMs with SM80 WMMA kernels that reach
++only 125-205 GB/s of the 273 GB/s available. This CUDA-core FMA kernel streams
++the weight once and reaches 240-255 GB/s for 1 <= M <= 16.
++
++Kernel and tuned plan table are ported from vLLM (Apache-2.0):
++  vllm/model_executor/kernels/linear/cute_dsl/{skinny_gemm,_skinny_gemm}.py
++  vllm/models/qwen4_exp/nvidia/low_latency_gemm.py  (QWEN4_EXP_SM121_GEMM_PLANS)
++
++Only shapes with an explicitly measured plan run here; everything else keeps
++cuBLAS. Output is BF16 with FP32 accumulation; the reduction order differs from
++cuBLAS, so results are numerically equivalent but not bit-identical.
++
++Env: SGLANG_SM121_SKINNY_GEMM=0 disables; SGLANG_SM121_SKINNY_GEMM_PDL=1 enables PDL.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import threading
++from collections import Counter
++from dataclasses import dataclass
++from typing import Any, Dict, Optional, Set, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_ENABLED = os.environ.get("SGLANG_SM121_SKINNY_GEMM", "1") == "1"
++_USE_PDL = os.environ.get("SGLANG_SM121_SKINNY_GEMM_PDL", "0") == "1"
++_PREFETCH_TILES = 2
++
++
++@dataclass(frozen=True)
++class SkinnyGemmConfig:
++    num_rows: int
++    block_size: int
++    outputs_per_block: int
++    k_unroll: int = 1
++    vector_width: int = 8
++    static_k: Optional[int] = None
++
++
++def row_stride_ok(a: torch.Tensor, config: SkinnyGemmConfig) -> bool:
++    vector_bytes = config.vector_width * a.element_size()
++    return (
++        a.stride(1) == 1
++        and a.stride(0) % config.vector_width == 0
++        and a.data_ptr() % vector_bytes == 0
++    )
++
++
++# --------------------------------------------------------------------------- plans
++# (N, K) -> {M: config}.  TP=2 local shapes of Qwen3.8-Flash-Next plus the TP=1
++# rows vLLM measured on GB10; unused rows cost nothing (compiled only when the
++# model actually has that weight shape).
++SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
++    # Shared-expert gate.
++    (1, 2560): {
++        1: SkinnyGemmConfig(1, 64, 1, k_unroll=2, static_k=2560),
++        2: SkinnyGemmConfig(2, 64, 1, k_unroll=2, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 128, 1, vector_width=2, static_k=2560),
++        8: SkinnyGemmConfig(8, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
++    },
++    # GDN fused B/A projection, TP=2.
++    (48, 2560): {
++        1: SkinnyGemmConfig(1, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 128, 2, k_unroll=4, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
++        8: SkinnyGemmConfig(8, 128, 1, k_unroll=4, vector_width=4, static_k=2560),
++        16: SkinnyGemmConfig(16, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++    },
++    # GDN fused B/A projection, TP=1.
++    (96, 2560): {
++        1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=2, static_k=2560),
++        2: SkinnyGemmConfig(2, 64, 4, vector_width=2, static_k=2560),
++        4: SkinnyGemmConfig(4, 128, 4, vector_width=2, static_k=2560),
++        8: SkinnyGemmConfig(8, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
++        16: SkinnyGemmConfig(16, 64, 1),
++    },
++    # Router.
++    (512, 2560): {
++        1: SkinnyGemmConfig(1, 256, 1, k_unroll=4, vector_width=2, static_k=2560),
++        2: SkinnyGemmConfig(2, 256, 1, k_unroll=4, vector_width=2, static_k=2560),
++        4: SkinnyGemmConfig(4, 64, 1, k_unroll=2, static_k=2560),
++        8: SkinnyGemmConfig(8, 64, 2, static_k=2560),
++    },
++    # Shared-expert fused gate/up, TP=2.
++    (640, 2560): {
++        1: SkinnyGemmConfig(1, 256, 1, vector_width=2, static_k=2560),
++        2: SkinnyGemmConfig(2, 256, 1, vector_width=2, static_k=2560),
++        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
++    },
++    # Shared-expert fused gate/up, TP=1.
++    (1280, 2560): {
++        1: SkinnyGemmConfig(1, 32, 1, k_unroll=2, static_k=2560),
++        2: SkinnyGemmConfig(2, 64, 1, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 128, 1, k_unroll=4, vector_width=2, static_k=2560),
++        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=2, static_k=2560),
++        16: SkinnyGemmConfig(16, 32, 1, k_unroll=2, static_k=2560),
++    },
++    # Shared-expert down projection, TP=1.
++    (2560, 640): {
++        1: SkinnyGemmConfig(1, 64, 1, k_unroll=4, vector_width=2, static_k=640),
++        2: SkinnyGemmConfig(2, 64, 1, vector_width=2, static_k=640),
++        4: SkinnyGemmConfig(4, 64, 1, vector_width=2, static_k=640),
++        8: SkinnyGemmConfig(8, 32, 1, k_unroll=4, vector_width=4, static_k=640),
++        16: SkinnyGemmConfig(16, 32, 1, k_unroll=2, vector_width=4, static_k=640),
++    },
++    # GDN and QSA output projections, TP=2.
++    (2560, 3072): {
++        1: SkinnyGemmConfig(1, 128, 2, k_unroll=2, vector_width=4, static_k=3072),
++        2: SkinnyGemmConfig(2, 64, 2, k_unroll=2, static_k=3072),
++        4: SkinnyGemmConfig(4, 64, 2, k_unroll=2, static_k=3072),
++    },
++    # GDN and QSA output projections, TP=1.
++    (2560, 6144): {
++        1: SkinnyGemmConfig(1, 64, 2, vector_width=4, static_k=6144),
++        2: SkinnyGemmConfig(2, 64, 1, k_unroll=4, vector_width=4, static_k=6144),
++        4: SkinnyGemmConfig(4, 64, 1, k_unroll=4, vector_width=4, static_k=6144),
++        8: SkinnyGemmConfig(8, 128, 1, vector_width=2, static_k=6144),
++        16: SkinnyGemmConfig(16, 32, 1, static_k=6144),
++    },
++    # QSA fused QKV/gate projection, TP=2.
++    (6656, 2560): {
++        1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
++    },
++    # GDN fused QKVZ projection, TP=2.
++    (8192, 2560): {
++        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 64, 2, k_unroll=2, static_k=2560),
++        4: SkinnyGemmConfig(4, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
++    },
++    # HC up projection.
++    (10240, 320): {
++        1: SkinnyGemmConfig(1, 32, 1, k_unroll=2, vector_width=2, static_k=320),
++    },
++    # QSA fused QKV/gate + replicated indexer Q/K, TP=1.
++    (13952, 2560): {
++        1: SkinnyGemmConfig(1, 32, 1, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 32, 1, k_unroll=2, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 32, 1, vector_width=4, static_k=2560),
++        8: SkinnyGemmConfig(8, 64, 1, vector_width=2, static_k=2560),
++        16: SkinnyGemmConfig(16, 32, 1, k_unroll=2, vector_width=4, static_k=2560),
++    },
++    # GDN fused QKVZ projection, TP=1.
++    (16384, 2560): {
++        1: SkinnyGemmConfig(1, 32, 1, k_unroll=4, vector_width=2, static_k=2560),
++        2: SkinnyGemmConfig(2, 32, 1, vector_width=2, static_k=2560),
++        4: SkinnyGemmConfig(4, 32, 1, k_unroll=2, vector_width=2, static_k=2560),
++        8: SkinnyGemmConfig(8, 64, 1, vector_width=2, static_k=2560),
++        16: SkinnyGemmConfig(16, 32, 1, k_unroll=2, vector_width=2, static_k=2560),
++    },
++    # Hot-vocab NEXTN draft head (65,536-token map), TP=2: reuse the TP=2 LM head plan.
++    (32768, 2560): {
++        1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++    },
++    # LM head, TP=2.
++    (124160, 2560): {
++        1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
++    },
++    # LM head, TP=1.
++    (248320, 2560): {
++        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 32, 1, vector_width=4, static_k=2560),
++        8: SkinnyGemmConfig(8, 64, 1, k_unroll=2, vector_width=4, static_k=2560),
++        16: SkinnyGemmConfig(16, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++    },
++}
++
++
++# --------------------------------------------------------------------------- kernel
++def _load_kernel_class():
++    """Import the CuTe kernel (module-level cutlass imports; works in and out of the package)."""
++    try:
++        from ._sm121_skinny_kernel import CuteSkinnyGemm  # type: ignore
++        return CuteSkinnyGemm
++    except ImportError:
++        import importlib.util
++        import sys
++
++        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sm121_skinny_kernel.py")
++        spec = importlib.util.spec_from_file_location("_sm121_skinny_kernel", path)
++        mod = importlib.util.module_from_spec(spec)
++        sys.modules["_sm121_skinny_kernel"] = mod
++        spec.loader.exec_module(mod)
++        return mod.CuteSkinnyGemm
++
++
++# --------------------------------------------------------------------------- runtime
++class ShapeDynamicSkinnyGemm:
++    def __init__(self) -> None:
++        self._compiled: Dict[Tuple[torch.dtype, SkinnyGemmConfig, bool], Any] = {}
++        self._kernel_cls = None
++        self._available: Optional[bool] = None
++        self._lock = threading.Lock()
++
++    def is_available(self) -> bool:
++        if self._available is None:
++            try:
++                import cutlass  # noqa: F401
++                import cutlass.cute  # noqa: F401
++                from quack.compile_utils import make_fake_tensor  # noqa: F401
++
++                self._available = True
++            except ImportError as e:
++                self._available = False
++                logger.info("sm121 skinny GEMM disabled: %s", e)
++        return self._available
++
++    @staticmethod
++    def _cutlass_dtype(dtype: torch.dtype):
++        from cutlass import BFloat16, Float16
++
++        return BFloat16 if dtype == torch.bfloat16 else Float16
++
++    @staticmethod
++    def _stream():
++        from cuda.bindings.driver import CUstream
++
++        return CUstream(torch.cuda.current_stream().cuda_stream)
++
++    def _compile(self, dtype: torch.dtype, config: SkinnyGemmConfig, has_residual: bool):
++        import cutlass.cute as cute
++        from quack.compile_utils import make_fake_tensor
++
++        if self._kernel_cls is None:
++            self._kernel_cls = _load_kernel_class()
++        element_type = self._cutlass_dtype(dtype)
++        n = cute.sym_int(divisibility=config.outputs_per_block)
++        k = (
++            config.static_k
++            if config.static_k is not None
++            else cute.sym_int(divisibility=config.block_size * config.vector_width)
++        )
++        a = make_fake_tensor(element_type, (config.num_rows, k), divisibility=config.vector_width)
++        b = make_fake_tensor(element_type, (n, k), divisibility=config.vector_width)
++        c = make_fake_tensor(element_type, (config.num_rows, n), divisibility=1)
++        residual = make_fake_tensor(element_type, (config.num_rows, n), divisibility=1)
++        kernel = self._kernel_cls(
++            element_type=element_type,
++            num_rows=config.num_rows,
++            block_size=config.block_size,
++            outputs_per_block=config.outputs_per_block,
++            vector_width=config.vector_width,
++            k_unroll=config.k_unroll,
++            has_residual=has_residual,
++            use_pdl=_USE_PDL,
++            static_k=config.static_k,
++        )
++        compiled = cute.compile(
++            kernel, a, b, residual, c, self._stream(),
++            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
++        )
++        self._compiled[(dtype, config, has_residual)] = compiled
++        return compiled
++
++    def precompile(self, dtype: torch.dtype, config: SkinnyGemmConfig, has_residual: bool = False) -> None:
++        key = (dtype, config, has_residual)
++        with self._lock:
++            if key in self._compiled:
++                return
++            fn = self._compile(dtype, config, has_residual)
++        # One real launch so the module is resident before any CUDA graph capture.
++        k = config.static_k or (config.block_size * config.vector_width * 2)
++        n = config.outputs_per_block * 8
++        dev = torch.cuda.current_device()
++        a = torch.zeros(config.num_rows, k, dtype=dtype, device=dev)
++        b = torch.zeros(n, k, dtype=dtype, device=dev)
++        c = torch.empty(config.num_rows, n, dtype=dtype, device=dev)
++        fn(a, b, c, c, self._stream())
++        torch.cuda.synchronize()
++
++    def __call__(self, a: torch.Tensor, b: torch.Tensor, config: SkinnyGemmConfig,
++                 residual: Optional[torch.Tensor] = None) -> torch.Tensor:
++        has_residual = residual is not None
++        key = (a.dtype, config, has_residual)
++        fn = self._compiled.get(key)
++        if fn is None:
++            with self._lock:
++                fn = self._compiled.get(key) or self._compile(a.dtype, config, has_residual)
++        output = torch.empty((a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device)
++        fn(a, b, output if residual is None else residual, output, self._stream())
++        return output
++
++
++skinny_gemm = ShapeDynamicSkinnyGemm()
++
++_is_sm121: Optional[bool] = None
++_misses: Counter = Counter()
++_miss_logged: Set[Tuple[int, int, int]] = set()
++
++
++def sm121_skinny_enabled() -> bool:
++    global _is_sm121
++    if not _ENABLED:
++        return False
++    if _is_sm121 is None:
++        _is_sm121 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 1)
++    return _is_sm121
++
++
++def _runtime_ok(x: torch.Tensor, weight: torch.Tensor, config: SkinnyGemmConfig) -> bool:
++    return (
++        x.dim() == 2
++        and row_stride_ok(x, config)
++        and weight.dim() == 2
++        and weight.stride() == (weight.shape[1], 1)
++        and x.dtype == torch.bfloat16
++        and weight.dtype == torch.bfloat16
++        and x.is_cuda
++        and weight.is_cuda
++        and x.shape[1] == weight.shape[1]
++        and (config.static_k is None or x.shape[1] == config.static_k)
++        and weight.shape[0] % config.outputs_per_block == 0
++        and x.shape[1] % (config.block_size * config.vector_width) == 0
++    )
++
++
++def _note_miss(n: int, k: int, m: int) -> None:
++    key = (n, k, m)
++    _misses[key] += 1
++    if key not in _miss_logged and _misses[key] >= 4:
++        _miss_logged.add(key)
++        logger.info("sm121 skinny GEMM: no plan for (N=%d, K=%d, M=%d); cuBLAS keeps it", n, k, m)
++
++
++def maybe_skinny_gemm(x: torch.Tensor, weight: torch.Tensor,
++                      residual: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
++    """Run the skinny kernel if (N, K, M) has a measured plan; else None (caller uses cuBLAS)."""
++    if not sm121_skinny_enabled() or x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
++        return None
++    x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
++    m = x2.shape[0]
++    if m < 1 or m > 16:
++        return None
++    n, k = weight.shape[0], weight.shape[1]
++    plan = SM121_GEMM_PLANS.get((n, k))
++    config = None if plan is None else plan.get(m)
++    if config is None:
++        _note_miss(n, k, m)
++        return None
++    if not _runtime_ok(x2, weight, config) or not skinny_gemm.is_available():
++        return None
++    if residual is not None:
++        residual = residual.reshape(m, n)
++        if not residual.is_contiguous() or residual.dtype != x.dtype:
++            residual = residual.contiguous().to(x.dtype)
++    out = skinny_gemm(x2, weight, config, residual)
++    return out if x.dim() == 2 else out.reshape(*x.shape[:-1], n)
++
++
++_warmed: Set[Tuple[int, int]] = set()
++
++
++def warmup_for_model(model: torch.nn.Module) -> None:
++    """Compile and touch every plan whose (N, K) matches a BF16 2-D weight in the model.
++
++    Call before CUDA graph capture; the graph then only records plain launches.
++    """
++    if not sm121_skinny_enabled() or not skinny_gemm.is_available():
++        return
++    shapes: Set[Tuple[int, int]] = set()
++    for mod in model.modules():
++        w = getattr(mod, "weight", None)
++        if isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16 and w.is_cuda:
++            shapes.add((w.shape[0], w.shape[1]))
++    todo = [s for s in shapes if s in SM121_GEMM_PLANS and s not in _warmed]
++    if not todo:
++        return
++    import time
++
++    t0 = time.time()
++    n_cfg = 0
++    for s in sorted(todo):
++        for cfg in SM121_GEMM_PLANS[s].values():
++            skinny_gemm.precompile(torch.bfloat16, cfg)
++            n_cfg += 1
++        _warmed.add(s)
++    logger.info("sm121 skinny GEMM: compiled %d configs for %d shapes %s in %.1fs",
++                n_cfg, len(todo), sorted(todo), time.time() - t0)
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 0d33b54d34..2b1735fd72 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -72,6 +72,11 @@ from sglang.srt.utils.common import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++from sglang.kernels.ops.gemm.sm121_skinny_gemm import (  # noqa: E402
++    maybe_skinny_gemm as _maybe_skinny_gemm,
++    sm121_skinny_enabled as _sm121_skinny_enabled,
++)
++
+ _is_npu = is_npu()
+ _is_cpu = is_cpu()
+ 
+@@ -1006,9 +1011,13 @@ class LogitsProcessor(nn.Module):
+                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                 )
+             else:
+-                logits = torch.matmul(
+-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+-                )
++                logits = None
++                if _sm121_skinny_enabled() and hidden_states.dtype == lm_head.weight.dtype:
++                    logits = _maybe_skinny_gemm(hidden_states, lm_head.weight)
++                if logits is None:
++                    logits = torch.matmul(
++                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
++                    )
+         else:
+             # GGUF models
+             # TODO: use weight_packed_linear for GGUF models
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 8edd7e7240..288b36db9d 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -429,6 +429,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         return F.embedding(input_, layer.weight)
+ 
+ 
++from sglang.kernels.ops.gemm.sm121_skinny_gemm import (  # noqa: E402
++    maybe_skinny_gemm as _maybe_skinny_gemm,
++    sm121_skinny_enabled as _sm121_skinny_enabled,
++)
++
++
+ class UnquantizedLinearMethod(LinearMethodBase):
+     """Linear method without quantization."""
+ 
+@@ -498,6 +504,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+                 return bf16_gemm_dispatch(x, layer.weight, bias)
+             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
+ 
++        if bias is None and _sm121_skinny_enabled() and x.is_cuda:
++            out = _maybe_skinny_gemm(x, layer.weight)
++            if out is not None:
++                return out
+         return F.linear(x, layer.weight, bias)
+ 
+     def apply_with_addend(
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 937cd160ae..8ed6f94a26 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1091,6 +1091,9 @@ class ModelRunner:
+         return self.sampling_prewarm_result
+ 
+     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
++        from sglang.kernels.ops.gemm.sm121_skinny_gemm import warmup_for_model
++
++        warmup_for_model(self.model)
+         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
+ 
+         # if get_moe_runner_backend().is_flashinfer_megamoe():
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 7afc056dd0..4126815dca 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -344,9 +344,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+ 
+         else:
+             if self.hot_token_id is not None and head is not None:
+-                head = head.clone()
+-                self.hot_token_id = self.hot_token_id.to(head.device)
+-                head.data = head.data[self.hot_token_id]
++                head, self.hot_token_id = _slice_hot_head(
++                    head, self.hot_token_id, target_lm_head
++                )
+ 
+             # Share the embedding and lm_head
+             self.draft_runner.model.set_embed_and_head(embed, head)
+@@ -1205,6 +1205,45 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         )
+ 
+ 
++def _slice_hot_head(head, hot_token_id, target_lm_head):
++    """Restrict an lm_head weight to the hot tokens, honouring vocab-parallel TP.
++
++    Under TP the target lm_head is sharded along the vocab: ``head`` holds only
++    rows [rank*part, (rank+1)*part). Each rank keeps the hot ids inside its own
++    range as *local* row indices and pads to a common length so the gathered
++    draft logits have equal-width shards. The returned hot_token_id lists the
++    global ids in gathered order (rank blocks in rank order, pads repeating a
++    real id of that block), so ``hot_token_id[topk_index]`` maps back exactly.
++    """
++    hot = hot_token_id.to(device=head.device, dtype=torch.int64)
++    tp_size = getattr(target_lm_head, "tp_size", 1) if target_lm_head is not None else 1
++    shard = getattr(target_lm_head, "shard_indices", None)
++    part = getattr(target_lm_head, "num_embeddings_per_partition", None)
++    if tp_size <= 1 or shard is None or part is None:
++        return head.data[hot], hot
++    rank = shard.org_vocab_start_index // part
++    blocks = []
++    for r in range(tp_size):
++        lo, hi = r * part, (r + 1) * part
++        ids = hot[(hot >= lo) & (hot < hi)]
++        if ids.numel() == 0:
++            ids = torch.tensor([lo], device=hot.device, dtype=torch.int64)
++        blocks.append(ids)
++    width = max(b.numel() for b in blocks)
++    padded = []
++    for b in blocks:
++        if b.numel() < width:
++            b = torch.cat([b, b[-1:].expand(width - b.numel())])
++        padded.append(b)
++    gathered_ids = torch.cat(padded)
++    local_rows = padded[rank] - rank * part
++    logger.info(
++        "hot-token draft head: TP=%d rank=%d keeps %d/%d ids (padded to %d per rank)",
++        tp_size, rank, blocks[rank].numel(), hot.numel(), width,
++    )
++    return head.data[local_rows], gathered_ids
++
++
+ class EAGLEWorkerV2(BaseSpecWorker):
+     def __init__(
+         self,
+-- 
+2.43.0
+

@@ -1,0 +1,27 @@
+# /etc/systemd/system/gpu-governor.service  (same unit on both nodes; per-node settings in /etc/gpu-governor.env)
+[Unit]
+Description=Dynamic GPU clock governor (idle cap / release) for DGX Spark GB10
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gpu-governor.env
+ExecStart=/usr/bin/python3 /opt/gpu-governor/gpu_governor.py
+# Whatever happens, leave the GPU unlocked when the service stops or dies.
+ExecStopPost=-/usr/bin/nvidia-smi -rgc
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Nice=5
+# Needs root for nvidia-smi -lgc; keep the rest tight.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/gpu-governor
+PrivateTmp=true
+NoNewPrivileges=true
+LogsDirectory=gpu-governor
+
+[Install]
+WantedBy=multi-user.target

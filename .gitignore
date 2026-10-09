@@ -1,0 +1,8 @@
+scripts/config.env
+*.pt
+*.pt.json
+windows/
+gsm8k_*/
+snapshot_*/
+__pycache__/
+*.log

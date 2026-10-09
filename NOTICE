@@ -1,0 +1,19 @@
+Balanced-SGLang-Qwen3.8-Flash-Next-NVFP4-Dual-DGX-Spark
+Copyright 2026 xin-osaka-u
+
+This repository is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The patches under patches/ modify SGLang (https://github.com/sgl-project/sglang),
+Copyright the SGLang contributors, Apache License 2.0.
+
+patches/0002-* contains the CuTe-DSL skinny GEMM kernel and SM121 plan table ported
+from vLLM (https://github.com/vllm-project/vllm), Copyright contributors to the vLLM
+project, Apache License 2.0:
+  vllm/model_executor/kernels/linear/cute_dsl/_skinny_gemm.py
+  vllm/models/qwen4_exp/nvidia/low_latency_gemm.py (QWEN4_EXP_SM121_GEMM_PLANS)
+
+The sampled-window PLE content check in patches/0006-* follows shantanugoel/ple_reuse.py
+(Apache License 2.0).
+
+Model weights are not included. Qwen3.8-Flash-Next and its NVFP4 checkpoint are
+distributed under their own licenses by their publishers.

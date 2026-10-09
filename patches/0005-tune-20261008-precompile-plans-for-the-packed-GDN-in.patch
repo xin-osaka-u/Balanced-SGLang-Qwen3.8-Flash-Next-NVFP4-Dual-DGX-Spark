@@ -1,0 +1,32 @@
+From a19cc5457a4faa4a8a0960149a24dfb0d67d0235 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:41:25 +0900
+Subject: [PATCH 5/8] tune-20261008: precompile plans for the packed GDN
+ in_proj buffer before graph capture
+
+---
+ python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+index dead5143d9..265ea4d4fd 100644
+--- a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
++++ b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+@@ -417,9 +417,11 @@ def warmup_for_model(model: torch.nn.Module) -> None:
+         return
+     shapes: Set[Tuple[int, int]] = set()
+     for mod in model.modules():
+-        w = getattr(mod, "weight", None)
+-        if isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16 and w.is_cuda:
+-            shapes.add((w.shape[0], w.shape[1]))
++        # Plain weights plus the packed GDN in_proj buffer (qwen3_5.finalize_fused_in_proj),
++        # which is a module attribute rather than a parameter.
++        for w in (getattr(mod, "weight", None), getattr(mod, "_fused_in_proj_weight", None)):
++            if isinstance(w, torch.Tensor) and w.dim() == 2 and w.dtype == torch.bfloat16 and w.is_cuda:
++                shapes.add((w.shape[0], w.shape[1]))
+     todo = [s for s in shapes if s in SM121_GEMM_PLANS and s not in _warmed]
+     if not todo:
+         return
+-- 
+2.43.0
+

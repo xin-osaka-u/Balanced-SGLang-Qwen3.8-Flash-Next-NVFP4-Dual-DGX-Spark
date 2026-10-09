@@ -1,0 +1,32 @@
+From 35e4c4841ade0059c1d8ff69573a863fbed1b677 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 21:18:47 +0900
+Subject: [PATCH 7/8] PLE reuse: rebuild always recreates the sparse file (no
+ in-place rewrite)
+
+---
+ python/sglang/srt/models/qwen4_exp_ple_reuse.py | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/models/qwen4_exp_ple_reuse.py b/python/sglang/srt/models/qwen4_exp_ple_reuse.py
+index 7d557d62e9..f5d8332eaa 100644
+--- a/python/sglang/srt/models/qwen4_exp_ple_reuse.py
++++ b/python/sglang/srt/models/qwen4_exp_ple_reuse.py
+@@ -160,9 +160,11 @@ def sidecar_matches(meta: Optional[Dict[str, Any]], fp: Dict[str, Any], table_pa
+ def map_table(table_path: str, nbytes: int, reuse: bool) -> Tuple[torch.Tensor, Optional[mmap.mmap]]:
+     """Map the table file; read-only when reusing."""
+     if not reuse:
+-        if not os.path.exists(table_path) or os.path.getsize(table_path) != nbytes:
+-            with open(table_path, "wb") as f:
+-                f.truncate(nbytes)  # sparse
++        # Always start from a fresh sparse file: rewriting a populated table in
++        # place goes through read-modify-write of the page cache and was measured
++        # at ~53 min on a GB10 versus ~8 min for a fresh file.
++        with open(table_path, "wb") as f:
++            f.truncate(nbytes)  # sparse
+         storage = torch.from_file(table_path, shared=True, size=nbytes, dtype=torch.uint8)
+         return storage, None
+     fd = os.open(table_path, os.O_RDONLY)
+-- 
+2.43.0
+

@@ -1,0 +1,165 @@
+From 004525b1e4d27be1cef999fbb86af971e1293bd9 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:15:36 +0900
+Subject: [PATCH 1/8] prod-local: QSA sm121 cute fallback + pynccl collectives
+ (pre-existing local patches)
+
+---
+ .../sglang/kernels/ops/attention/__init__.py  | 29 ++++++++++++++---
+ .../sglang/srt/distributed/parallel_state.py  | 31 +++++++++++++------
+ 2 files changed, 45 insertions(+), 15 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/attention/__init__.py b/python/sglang/kernels/ops/attention/__init__.py
+index c2e046daa8..4ff94e6b82 100644
+--- a/python/sglang/kernels/ops/attention/__init__.py
++++ b/python/sglang/kernels/ops/attention/__init__.py
+@@ -105,19 +105,38 @@ def qwen38_qsa_sm121_varlen(
+     max_seqlen_k: int = 0,
+     softmax_scale: float = 1.0,
+     causal: bool = True,
+-    **_: object,
++    **kwargs: object,
+ ) -> torch.Tensor:
+     """Run the only SM121 packed-QSA kernel for its qualified contract."""
+     del causal
+     if max_seqlen_q != 1:
+         raise ValueError(f"QSA requires max_seqlen_q=1, got {max_seqlen_q}")
++    if k.dtype != q.dtype:
++        k = k.to(q.dtype)
++    if v.dtype != q.dtype:
++        v = v.to(q.dtype)
+     if not can_use_kda_qwen38_qsa_sm121(
+         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_k
+     ):
+-        raise ValueError(
+-            "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
+-            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
+-        )
++        try:
++            from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
++            output = cute_varlen_func(
++                q=q,
++                k=k,
++                v=v,
++                cu_seqlens_q=cu_seqlens_q,
++                cu_seqlens_k=cu_seqlens_k,
++                max_seqlen_q=max_seqlen_q,
++                max_seqlen_k=max_seqlen_k,
++                softmax_scale=softmax_scale,
++                causal=True,
++            )
++            return output[0] if isinstance(output, tuple) else output
++        except Exception:
++            raise ValueError(
++                "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
++                "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
++            )
+     return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
+         q,
+         k,
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index f5441452ae..6ecd37895d 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1076,6 +1076,9 @@ class GroupCoordinator:
+             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+         ):
+             torch_symm_mem_comm.all_reduce(input_, out=input_)
++        elif pynccl_comm is not None:
++            with pynccl_comm.change_state(enable=True):
++                pynccl_comm.all_reduce(input_)
+         else:
+             torch.distributed.all_reduce(input_, group=self.device_group)
+ 
+@@ -1130,6 +1133,9 @@ class GroupCoordinator:
+             )
+             with pynccl_comm.change_state(enable=True):
+                 pynccl_comm.reduce_scatter(output, input)
++        elif pynccl_comm is not None:
++            with pynccl_comm.change_state(enable=True):
++                pynccl_comm.reduce_scatter(output, input)
+         else:
+             reduce_scatter_single(output, input, group=self.device_group)
+         return output
+@@ -1196,11 +1202,8 @@ class GroupCoordinator:
+                     ca_comm.reduce_scatter(input, output, registered=True)
+             elif is_in_tc_piecewise_cuda_graph():
+                 ca_comm.reduce_scatter(input, output, registered=False)
+-            else:
+-                # True CUDA graph warmup: avoid a different host collective.
+-                output.zero_()
+-            return True
+-        ca_comm.reduce_scatter(input, output, registered=False)
++        else:
++            ca_comm.reduce_scatter(input, output, registered=False)
+         return True
+ 
+     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+@@ -1208,6 +1211,9 @@ class GroupCoordinator:
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is not None and not pynccl_comm.disabled:
+             pynccl_comm.all_to_all_single(output, input)
++        elif pynccl_comm is not None:
++            with pynccl_comm.change_state(enable=True):
++                pynccl_comm.all_to_all_single(output, input)
+         else:
+             torch.distributed.all_to_all_single(output, input, group=self.device_group)
+ 
+@@ -1222,7 +1228,6 @@ class GroupCoordinator:
+         output: torch.Tensor,
+         input_list: List[torch.Tensor],
+     ) -> None:
+-        # TODO(ch-wan): support other backends
+         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
+         return output
+ 
+@@ -1277,14 +1282,15 @@ class GroupCoordinator:
+             else:
+                 assert input_.shape[0] % world_size == 0
+                 chunk_size = input_.shape[0] // world_size
+-            output_shape = (chunk_size,) + input_.shape[1:]
+ 
+             if output is None:
+                 output = torch.empty(
+-                    output_shape, dtype=input_.dtype, device=input_.device
++                    (chunk_size, *input_.shape[1:]),
++                    dtype=input_.dtype,
++                    device=input_.device,
+                 )
+             else:
+-                assert output.shape == output_shape
++                assert output.shape == (chunk_size, *input_.shape[1:])
+ 
+             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+             return output
+@@ -1316,7 +1322,6 @@ class GroupCoordinator:
+                 elif is_in_tc_piecewise_cuda_graph():
+                     ca_comm.all_gather_unreg(input, out=output, dim=0)
+                 else:
+-                    # True CUDA graph warmup: avoid a different host collective.
+                     output.zero_()
+                 return
+             else:
+@@ -1339,6 +1344,9 @@ class GroupCoordinator:
+             )
+             with pynccl_comm.change_state(enable=True):
+                 pynccl_comm.all_gather(output, input)
++        elif pynccl_comm is not None:
++            with pynccl_comm.change_state(enable=True):
++                pynccl_comm.all_gather(output, input)
+         else:
+             all_gather_single(output, input, group=self.device_group)
+ 
+@@ -1561,6 +1569,9 @@ class GroupCoordinator:
+ 
+         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+             self.pynccl_comm.broadcast(input_, src=src)
++        elif self.pynccl_comm is not None:
++            with self.pynccl_comm.change_state(enable=True):
++                self.pynccl_comm.broadcast(input_, src=src)
+         else:
+             # Broadcast.
+             torch.distributed.broadcast(
+-- 
+2.43.0
+

@@ -1,0 +1,74 @@
+From 4a6de069441d8ddd3691558cdae73fa9498841b0 Mon Sep 17 00:00:00 2001
+From: xin-osaka-u <329067957+xin-osaka-u@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:22:36 +0900
+Subject: [PATCH 4/8] tune-20261008: plans for fused GDN in_proj (8240,2560),
+ (10240,2560), (2560,2560), HC (336,10240)/(320,2560); hook bf16_gemm_dispatch
+
+---
+ .../kernels/ops/gemm/sm121_skinny_gemm.py     | 28 +++++++++++++++++++
+ .../sglang/srt/layers/quantization/unquant.py |  7 +++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+index 25836d3ddc..dead5143d9 100644
+--- a/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
++++ b/python/sglang/kernels/ops/gemm/sm121_skinny_gemm.py
+@@ -165,9 +165,37 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
+     # Per-layer BF16 projection seen at verify (SGLang TP=2 fusion), measured 2026-10-08.
+     (10240, 2560): {
+         4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+     },
+     (2560, 2560): {
+         4: SkinnyGemmConfig(4, 128, 2, k_unroll=4, vector_width=4),
++        1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 128, 2, k_unroll=4, vector_width=4),
++        3: SkinnyGemmConfig(3, 128, 2, k_unroll=4, vector_width=4),
++    },
++    # GDN fused qkvz+ba input projection (SGLang packs both into one GEMM), TP=2.
++    (8240, 2560): {
++        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++    },
++    # HC inject projection.
++    (336, 10240): {
++        1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=4, static_k=10240),
++        2: SkinnyGemmConfig(2, 256, 1, k_unroll=2, vector_width=4, static_k=10240),
++        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4, static_k=10240),
++        4: SkinnyGemmConfig(4, 256, 1, k_unroll=2, vector_width=4, static_k=10240),
++    },
++    # HC mix down projection.
++    (320, 2560): {
++        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
++        2: SkinnyGemmConfig(2, 64, 1, k_unroll=4, vector_width=4, static_k=2560),
++        3: SkinnyGemmConfig(3, 64, 1, k_unroll=4, vector_width=4, static_k=2560),
++        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+     },
+     # Hot-vocab NEXTN draft head (65,536-token map), TP=2: reuse the TP=2 LM head plan.
+     (32768, 2560): {
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 3ae174454d..6654bf81ec 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -338,6 +338,13 @@ def _bf16_gemm_dispatch_impl(
+         output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+             *x.shape[:-1], -1
+         )
++    elif (
++        bias is None
++        and _sm121_skinny_enabled()
++        and x.is_cuda
++        and (skinny_out := _maybe_skinny_gemm(x, weight)) is not None
++    ):
++        output = skinny_out
+     elif addend is not None:
+         # cuBLAS folds the addend in through the GEMM beta input;
+         # a bias would need a third operand, so callers must exclude it.
+-- 
+2.43.0
+

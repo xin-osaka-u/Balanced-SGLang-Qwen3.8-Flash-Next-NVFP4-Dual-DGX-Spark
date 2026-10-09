@@ -1,0 +1,4 @@
+// Keep apt package caches in memory instead of rewriting ~126 MB on disk on
+// every hourly DGX Dashboard update check (measured ~7 GB/day/node).
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
