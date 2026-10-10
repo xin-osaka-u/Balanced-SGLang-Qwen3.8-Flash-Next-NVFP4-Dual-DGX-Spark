@@ -65,6 +65,13 @@ f3.run(gov3, 4, util=90, power=75.0)
 assert gov3.alarm == "", gov3.alarm
 print("4 self-check ok")
 
+# 4b. clock-based latch detector: decode-like load (14 W, 2190 MHz) is fine; 611 MHz while busy alarms; recovery clears
+f3b, gov3b = master(busy_util_pct=50, busy_samples=3, busy_min_clock_mhz=1500)
+f3b.run(gov3b, 10, util=70, power=14.0); assert gov3b.alarm == "", gov3b.alarm
+f3b.clock = 611; f3b.run(gov3b, 10, util=90, power=5.5); assert gov3b.alarm.startswith("GPU busy"), gov3b.alarm
+f3b.clock = 2190; f3b.run(gov3b, 4, util=90, power=14.0); assert gov3b.alarm == "", gov3b.alarm
+print("4b clock latch ok")
+
 # 5. nvidia-smi failures -> fail-safe after 3, alarm set, clears on success
 f4, gov4 = master(apply_fail_limit=3)
 f4.run(gov4, 302)  # idle -> tries -lgc

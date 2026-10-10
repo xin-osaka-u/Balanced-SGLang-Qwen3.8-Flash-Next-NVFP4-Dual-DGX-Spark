@@ -27,7 +27,7 @@ ExecStopPost=nvidia-smi -rgc as a second belt.
 
 Self-check (also a hardware clock-latch detector): when active and the GPU is
 busy (utilization >= GOV_BUSY_UTIL_PCT for GOV_BUSY_SAMPLES consecutive
-samples), power.draw must reach GOV_POWER_OK_W; otherwise an ALARM is logged,
+samples), clocks.gr must reach GOV_BUSY_MIN_CLOCK_MHZ (and power.draw GOV_POWER_OK_W when set); otherwise an ALARM is logged,
 GOV_ALERT_CMD is run (message in $GOV_ALERT_MSG) and /status shows it. A GB10
 whose EC latched the clock at ~600 MHz shows exactly this signature (busy, a
 few watts) and nvidia-smi cannot fix it; only a power drain can.
@@ -74,7 +74,8 @@ class Config:
     idle_clocks: str = "210,1000"        # nvidia-smi -lgc argument when idle
     active_clocks: str = ""              # "" -> -rgc; e.g. "300,2200" for a thermal cap
     watchdog_s: float = 90.0             # worker: release if the master is silent this long
-    power_ok_w: float = 30.0             # busy GPU must draw at least this
+    power_ok_w: float = 0.0              # >0: a busy GPU must draw at least this (0 = off; decode draws only ~14 W)
+    busy_min_clock_mhz: int = 1500       # >0: a busy, uncapped-or-active GPU must clock at least this (latch: ~611)
     busy_util_pct: int = 50
     busy_samples: int = 3
     alarm_repeat_s: float = 3600.0       # re-run the alert command at most this often
@@ -100,6 +101,7 @@ class Config:
         c.active_clocks = g("ACTIVE_CLOCKS", c.active_clocks).strip()
         c.watchdog_s = float(g("WATCHDOG_S", c.watchdog_s))
         c.power_ok_w = float(g("POWER_OK_W", c.power_ok_w))
+        c.busy_min_clock_mhz = int(g("BUSY_MIN_CLOCK_MHZ", c.busy_min_clock_mhz))
         c.busy_util_pct = int(g("BUSY_UTIL_PCT", c.busy_util_pct))
         c.busy_samples = int(g("BUSY_SAMPLES", c.busy_samples))
         c.alarm_repeat_s = float(g("ALARM_REPEAT_S", c.alarm_repeat_s))
@@ -323,22 +325,24 @@ class Governor:
             self.release("watchdog")
 
     def _self_check(self, s: Sample) -> None:
-        """Busy GPU must draw real power once the cap is released."""
+        """A busy GPU must run at a real clock (and, if configured, draw real power) once the cap is released."""
         if not s.ok:
             return
         with self.lock:
             busy = s.util_pct >= self.cfg.busy_util_pct
             self.busy_streak = self.busy_streak + 1 if busy else 0
             settled = self.mode != "idle" and (self.now() - self.released_at) >= 2 * self.cfg.poll_s
-            trip = settled and self.busy_streak >= self.cfg.busy_samples and s.power_w >= 0 and s.power_w < self.cfg.power_ok_w
-            clear = settled and busy and s.power_w >= self.cfg.power_ok_w and self.alarm.startswith("GPU busy")
+            low_clock = self.cfg.busy_min_clock_mhz > 0 and 0 <= s.clock_mhz < self.cfg.busy_min_clock_mhz
+            low_power = self.cfg.power_ok_w > 0 and 0 <= s.power_w < self.cfg.power_ok_w
+            trip = settled and self.busy_streak >= self.cfg.busy_samples and (low_clock or low_power)
+            clear = settled and busy and not (low_clock or low_power) and self.alarm.startswith("GPU busy")
         if trip:
-            self._raise_alarm(f"GPU busy ({s.util_pct}% util, {s.clock_mhz} MHz) but only {s.power_w:.1f} W (< {self.cfg.power_ok_w:.0f} W): "
+            self._raise_alarm(f"GPU busy ({s.util_pct}% util) but clock {s.clock_mhz} MHz (< {self.cfg.busy_min_clock_mhz}) / {s.power_w:.1f} W: "
                               "cap not released or EC clock latch; power-drain the node if nvidia-smi -rgc does not help")
         elif clear:
             with self.lock:
                 self.alarm = ""
-            log.info("self-check: power back to %.1f W under load, alarm cleared", s.power_w)
+            log.info("self-check: %d MHz / %.1f W under load, alarm cleared", s.clock_mhz, s.power_w)
 
     def _raise_alarm(self, msg: str) -> None:
         with self.lock:

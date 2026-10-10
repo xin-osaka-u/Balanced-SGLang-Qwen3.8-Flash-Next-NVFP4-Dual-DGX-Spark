@@ -12,6 +12,9 @@ project, Apache License 2.0:
   vllm/model_executor/kernels/linear/cute_dsl/_skinny_gemm.py
   vllm/models/qwen4_exp/nvidia/low_latency_gemm.py (QWEN4_EXP_SM121_GEMM_PLANS)
 
+patches/0009-* follows the idea of the draft SGLang pull request sgl-project/sglang#40143
+(multi-group QSA pending ring), with a different group count.
+
 The sampled-window PLE content check in patches/0006-* follows shantanugoel/ple_reuse.py
 (Apache License 2.0).
 

@@ -1,0 +1,65 @@
+{
+  "aggregate": {
+    "error_rate": 0.0,
+    "score": 0.7172244210232868,
+    "stop_rate": 0.6979166666666666,
+    "task.mk_niah_basic": 1.0,
+    "task.mk_niah_easy": 0.9290157881334352,
+    "task.mk_niah_hard": 0.375,
+    "task.mk_niah_medium": 0.5,
+    "task.mv_niah_basic": 1.0,
+    "task.mv_niah_easy": 0.2883875340110737,
+    "task.mv_niah_hard": 0.7629310344827587,
+    "task.mv_niah_medium": 0.12635869565217392,
+    "task.qa_basic": 1.0,
+    "task.qa_easy": 1.0,
+    "task.qa_hard": 0.875,
+    "task.qa_medium": 0.75,
+    "truncated_rate": 0.3020833333333333
+  },
+  "base_url": "http://127.0.0.1:8001/v1",
+  "bench_args": {
+    "dataset_size": 8,
+    "seq_len": 32768,
+    "tokenizer": "/models/Qwen3.8-Flash-Next-NVFP4",
+    "tokenizer_type": "hf"
+  },
+  "gen": {
+    "chat_template_kwargs": null,
+    "extra_body": null,
+    "max_tokens": 256,
+    "min_p": 0.0,
+    "reasoning_effort": null,
+    "repetition_penalty": 1.0,
+    "seed": null,
+    "system_message": null,
+    "temperature": 0.0,
+    "top_p": 0.95
+  },
+  "latency_seconds": 2889.2500796318054,
+  "model": "qwen3.8-flash-next",
+  "n_repeats": 1,
+  "name": "ruler2",
+  "ns_commit_sha": "645cf567ff08c0ae9cc3fc8e1edbb975b3067816",
+  "num_examples": 96,
+  "num_threads": 4,
+  "output_throughput_tps": 4.142251335171774,
+  "sgl_eval_version": "0.1.2",
+  "timestamp": "20261010-105018",
+  "token_usage": {
+    "completion_tokens": {
+      "count": 96,
+      "mean": 124.66666666666667
+    },
+    "prompt_tokens": {
+      "count": 96,
+      "mean": 31082.104166666668
+    },
+    "reasoning_tokens": {
+      "count": 96,
+      "mean": 0.0
+    }
+  },
+  "total_completion_tokens": 11968,
+  "total_prompt_tokens": 2983882
+}

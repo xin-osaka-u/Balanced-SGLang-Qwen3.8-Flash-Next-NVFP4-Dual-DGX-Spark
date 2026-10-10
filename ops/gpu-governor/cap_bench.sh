@@ -5,7 +5,7 @@
 # Each cap runs ~/tune_20261008/run_window.sh cap_<x> (det_bench + lossless + profile) and samples power/temp.
 set -u
 CAPS=${1:-"none 2200 1800"}
-RW=../../tools/bench/run_window.sh
+RW=../../tools/bench/run_window.sh   # keep the torch profiler off here: it leaves GBs of heap in the scheduler until restart
 OUT=./results; mkdir -p "$OUT"
 setcap() {  # none|MHz
   if [ "$1" = none ]; then sudo nvidia-smi -rgc >/dev/null; ssh spark2 sudo nvidia-smi -rgc >/dev/null

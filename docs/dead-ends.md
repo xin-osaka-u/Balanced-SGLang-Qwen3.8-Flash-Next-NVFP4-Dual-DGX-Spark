@@ -4,7 +4,10 @@
 |---|---|---|
 | `NCCL_MIN/MAX_NCHANNELS=4` (from some Spark guides) | Single-stream decode 56 → 42.8 tok/s | Keep the default of 16 channels |
 | Newer cuBLAS (13.4.2.4, 13.8.1.7) preloaded under torch 2.13 | Picked the same `cutlass_80_wmma` kernels for all 36 decode shapes: 12,740 / 12,904 / 12,933 µs total vs 13.1.1.3. 13.8 was slower on a few small shapes. | The sm_121 notes cover NVFP4/MXFP8 large GEMMs, not small-M BF16. Use the skinny GEMM instead. |
-| Deeper drafts (NEXTN 7/8, adaptive) | Startup refused: QSA requires `num_draft_tokens <= compress_ratio (4)` | 3/1/4 is the ceiling on SGLang for this model today |
+| Deeper drafts on stock SGLang (NEXTN 7/8, adaptive) | Startup refused: QSA requires `num_draft_tokens <= compress_ratio (4)` | Needs patch 0009. This was a dead end until we wrote it. |
+| A *fixed* deeper draft (7 steps / 8 tokens) | Not shipped. From measured per-step cost (4–5 ms) and acceptance lengths, we projected +32% on JSON, −16% on prose and −11% on reasoning. | Use adaptive depth, which got +50% on JSON with prose unchanged |
+| GSM8K on the first 300 questions as a quick gate | 96.67% and 97.67% from two runs of one configuration | Too noisy to see a one-point effect. Run all 1319. |
+| Active clock cap at 1800 MHz | About 10% slower on prose than uncapped (2200 MHz: about 4%), for 3 W less than 2200 MHz | 2200 MHz is the better trade for us |
 | PLE file backend with `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB=16` (default 8) | No TTFT improvement | Keep 8 |
 | `--disable-flashinfer-autotune` | 64.5 vs 65.5 tok/s, within noise | No effect |
 | `--boundary-reduction` (resolves to `rs+rsv` for this model) | Profile shows only AllReduce at TP=2 with batch ≤ 4; it falls back as documented | Nothing to gain at our batch sizes |

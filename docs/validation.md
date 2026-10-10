@@ -36,7 +36,8 @@ tools/bench/run_window.sh <tag>      # waits for health, warms up, runs det_benc
 
 - `det_bench.py` reports tok/s, TTFT, and whether the 3 repeats were identical.
 - Compare against your own previous window on the same boxes. A 3-run mean on the JSON prompt is stable to about ±3%; prose varies more.
-- Also check the acceptance length in the server log (`accept len`): about 4.0 on the JSON prompt, 2.6–3.5 on prose.
+- Also check the acceptance length in the server log (`accept len`). With adaptive depth: 5–8 on the JSON prompt, about 2.2 on prose. With fixed 3/1/4: about 4.0 and 2.2–3.5.
+- With adaptive depth, the first JSON run after a quiet period is slower (80–87 tok/s against 112). Look at runs 2 and 3.
 
 ## Gate 3: GSM8K with the author's protocol (after engine/kernel changes, ~100 min)
 
@@ -50,6 +51,8 @@ Pass when:
 - the truncation rate and mean tokens per question have not grown.
 
 A change that makes the model "think longer" is a regression even if the score holds. GSM8K is saturated, so treat it as a tripwire, not a ranking.
+
+Run all 1319 questions. We tried the first 300 as a shortcut: two runs of the same configuration scored 96.67% and 97.67%, which is wider than the effect we were looking for.
 
 ## Gate 4: non-thinking snapshot (after big upgrades, ~2.5 h)
 
@@ -68,6 +71,17 @@ Pass when:
 - all shards are byte-identical to the checkpoint,
 - the mapping is read-only (`r--s`), and
 - the table's mtime does not advance while serving.
+
+## Gate 6: RULER2 at 32k (after changes to attention, KV layout or block selection, ~1 h)
+
+```bash
+python tools/eval/nt_proxy.py &
+TOKENIZER=/path/to/model tools/eval/run_ruler2.sh ./ruler2_<tag>
+```
+
+Gates 1–3 use short sequences. This model's sparse attention only starts *selecting* blocks beyond 2,048 tokens, so a bug in that path is invisible to them. Compare subtask by subtask against [results/](../results): with 8 samples per subtask, one sample is 12.5%, and our three reference runs differ by exactly that on 3 of 12 subtasks.
+
+For patch 0009 specifically, also run the two offline checks in [tools/qsa_ring](../tools/qsa_ring).
 
 ## What we deliberately do not use as gates
 

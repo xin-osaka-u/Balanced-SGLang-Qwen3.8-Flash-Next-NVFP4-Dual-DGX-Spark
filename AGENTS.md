@@ -15,7 +15,7 @@ Ask your user before changing any of these. They are policy, not tuning:
   - BF16 KV.
   - No requantization, expert pruning, FP8 dense layers or 4-bit heads.
   - Speculative decoding only in forms where the target model verifies every token.
-- **Every change passes gate 1** (structured CN/JP extraction, field-level exact) **before it ships.** After engine changes, it must also pass gate 3 (GSM8K, author protocol, within the BF16 band, with no growth in tokens per question).
+- **Every change passes gate 1** (structured CN/JP extraction, field-level exact) **before it ships.** After engine changes, it must also pass gate 3 (GSM8K, author protocol, within the BF16 band, with no growth in tokens per question). After changes to attention or KV layout, also gate 6 (RULER2 at 32k).
 - **Compare against the same boxes' recorded baseline**, not against other people's numbers.
 - **Prefer tuning to rolling back,** but ask the human before rolling back production.
 - **Warm or compile kernels with no model loaded,** and cap `MAX_JOBS=4` on unified-memory boxes.
@@ -27,8 +27,10 @@ Ask your user before changing any of these. They are policy, not tuning:
   - The skinny GEMM plan table includes TP=1 rows from vLLM.
   - The hot-token head needs no slicing at TP=1.
 - **Different languages:** rebuild the hot-token table (`tools/hot_tokens/build_hot_tokens.py`). Check `accept len` in the server log before and after on the user's real prompts.
+- **Mostly concurrent reasoning or agents:** adaptive draft depth cost us about 10% on 4-way GSM8K against fixed 3/1/4. Keep patch 0009 and drop `--speculative-adaptive`, then measure both on the user's workload.
 - **More concurrency (agents):** raise `--max-running-requests` and `--cuda-graph-max-bs-decode` together. The skinny GEMM only plans M ≤ 16, so larger batches fall back to cuBLAS automatically. Re-measure aggregate throughput and keep about 30–40 GB of unified memory free.
 - **Newer SGLang:** apply the patches one at a time and run the gates after each.
+  - Patch 0009 touches the QSA slot arithmetic in three places, including a Triton kernel. After rebasing it, run both checks in [tools/qsa_ring](tools/qsa_ring) before starting a server.
   - Check first whether [sglang#43249](https://github.com/sgl-project/sglang/pull/43249) and [#43250](https://github.com/sgl-project/sglang/pull/43250) are merged, and whether 0001 is still needed.
 - **Other GB10 boxes:** after every power event, check for the clock latch: a 15 s fp16 matmul should reach about 80 W.
 
@@ -36,6 +38,7 @@ Ask your user before changing any of these. They are policy, not tuning:
 See [docs/dead-ends.md](docs/dead-ends.md). In short:
 - Fewer NCCL channels.
 - Newer cuBLAS.
-- Deeper drafts on QSA.
+- A fixed deeper draft (adaptive depth is the one that pays).
+- A 300-question GSM8K subset as a gate.
 - A bigger PLE RSS budget.
 - A/B tests on sampled chat prompts.

@@ -23,8 +23,9 @@ SGLANG_ARGS=(
   --max-total-tokens 380928                    # freed memory kept as headroom, not a bigger KV pool
   --context-length 200000
   --nnodes 2 --dist-init-addr "$MASTER_ADDR:$MASTER_PORT" --tp-size 2
-  --speculative-algorithm NEXTN --speculative-num-steps 3
-  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4   # QSA caps draft tokens at 4
+  --speculative-algorithm NEXTN --speculative-adaptive          # depth adapts per request: 1/3/5/7 steps
+  --speculative-num-steps 3                                     # starting depth. Adaptive needs patch 0009;
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4   # without it, drop --speculative-adaptive (fixed 3/1/4)
   --speculative-token-map "$HOT_TOKEN_MAP"
   --trust-remote-code
 )

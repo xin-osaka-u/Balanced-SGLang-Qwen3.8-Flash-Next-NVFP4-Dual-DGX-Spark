@@ -23,24 +23,28 @@ tools/bench/run_window.sh boot-$(date +%m%d)   # gates 1 + 2 after every restart
 | Weight loading stalls at 97% for more than 10 min, with about 39 MB/s of random IO | Rewriting an already-populated PLE file in place (without the reuse patches) | IO pressure in `/proc/pressure/io`, major faults | Use the reuse patches. Without them, delete `ple_table_*.bin` before each boot. |
 | Scheduler OOM-killed on the first start after an upgrade | flashinfer JIT with ~20 parallel nvcc jobs while the model held ~90 GB | `dmesg`, journal | Warm kernels with no model loaded; `MAX_JOBS=4` |
 | Server dies at start with a device-side assert in `init_lm_head` | `--speculative-token-map` at TP>1 on unpatched SGLang | Traceback | Patch 0002 / [sglang#43249](https://github.com/sgl-project/sglang/pull/43249) |
-| Startup fails with deeper drafts (7/8 draft tokens) | QSA requires `num_draft_tokens <= 4` | Startup error | Stay at NEXTN 3/1/4 |
+| Startup fails with deeper drafts (7/8 draft tokens, or `--speculative-adaptive`) | Stock QSA pending ring holds one group, so it requires `num_draft_tokens <= 4` | Startup error | Patch 0009, or stay at fixed 3/1/4 |
+| Available memory fell from 43 GB to 26–31 GB after a night of evaluations; flat when idle | Scheduler Python heap grew to 12–13 GB per node. A torch profiler run inside the benchmark window was one contributor. | `/proc/<pid>/smaps_rollup`: large `[heap]`, GPU allocation unchanged | Not a GPU leak. It clears on restart. Keep the profiler out of routine windows. |
+| Governor alarm "GPU busy but only 14 W" on a healthy node | Our first latch check used power (< 30 W). Normal decode draws only about 14 W. | Alarm during ordinary traffic | The check now uses the clock (< 1500 MHz while busy) |
+| An overnight test chain stopped half way with a shell syntax error | We edited the bash script while it was running. Bash reads a script incrementally. | The runner exited without its final marker | Never edit a running script. Copy it and run the copy. |
 | Worker kernel panic (`BUG mm/slub.c`, freeing a network skb in softirq), once | Unknown. At the time the box was also copying from a USB HDD. | `/var/lib/systemd/pstore` | Rebooted. Not reproduced since; we are watching for a second occurrence. |
 
-## Idle power: GPU clock governor (optional)
+## Power: GPU clock governor (optional)
 
-[ops/gpu-governor](../ops/gpu-governor) is a small stdlib-only service.
+[ops/gpu-governor](../ops/gpu-governor) is a small stdlib-only service. It has run on both of our nodes since 2026-10-09.
 
 **What it does:**
-- After 300 s with no GPU activity, it caps clocks on both nodes (`nvidia-smi -lgc 210,1000`), and releases them immediately on activity.
-- It also raises an alarm if a node can't reach 30 W while busy, which is exactly the latch above.
+- After 300 s with no GPU activity, it caps clocks on both nodes (`nvidia-smi -lgc 210,1000`), and lifts the idle cap immediately on activity.
+- While active it can hold a second, higher cap. We use 2200 MHz ([decisions.md](decisions.md)).
+- It raises an alarm if a busy node stays below 1500 MHz, which is exactly the latch above.
 
-**Verified so far:**
-- Capped idle draws 5.7–6.3 W instead of 11–12 W per node, and runs about 3 °C cooler.
-- A dry run on both nodes worked: synchronized idle and active switching, wake on `POST /wake`, release on exit.
+**Measured:**
+- Idle: 5.5–6.3 W instead of 11–12 W per node, about 3 °C cooler.
+- Decoding at the 2200 MHz cap: 12.5 W instead of 19–24 W per node, about 4% slower.
 
-**Not yet verified:** it has not run in production yet. Start it with `GOV_DRY_RUN=1` and watch at least one of your traffic cycles before letting it touch clocks.
+Start it with `GOV_DRY_RUN=1` and watch at least one of your traffic cycles before letting it touch clocks.
 
-The saving is about 0.1 kWh/day per node (about 6 W for about 16 idle hours a day). It is small, but the latch alarm alone justifies running it.
+The idle saving is about 0.1 kWh/day per node (about 6 W for about 16 idle hours a day). It is small, but the latch alarm alone justifies running it.
 
 ## SSD wear budget
 
